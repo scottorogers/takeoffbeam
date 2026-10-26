@@ -53,6 +53,10 @@ These links always point at the newest version.
 
 ## Get it
 
+- **Intel Mac / Docker:** run the full Linux desktop app in your browser using
+  [the Docker setup](docs/docker.md). Includes persistent drawings, settings and
+  the CLI; opens at `http://localhost:6080`.
+
 - **macOS (Apple silicon):** [Takeoff-Desk-arm64.dmg](https://pub-061018a047d54079b309fb16a26a1ce0.r2.dev/takeoff-desk/latest/Takeoff-Desk-arm64.dmg), signed and notarized by Neuratwin Inc.
 - **Windows 10/11 (x64):** [Takeoff-Desk-x64-setup.exe](https://pub-061018a047d54079b309fb16a26a1ce0.r2.dev/takeoff-desk/latest/Takeoff-Desk-x64-setup.exe). Not code-signed yet; signing is coming in a later release. Until then Windows SmartScreen shows *Windows protected your PC* with an unknown publisher: choose *More info → Run anyway*.
 - **From source:** `scripts/fetch-pdfium.sh && cargo run --release -p takeoff-app`.

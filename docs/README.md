@@ -12,6 +12,7 @@
 | [File format](file-format.md) | The `.takeoff.json` sidecar |
 | [Architecture](architecture.md) | Crates, threads, rendering, the agent loop |
 | [Building & releasing](building.md) | Dev setup, tests, packaging, signing |
+| [Docker browser desktop](docker.md) | Full app on Intel Macs through noVNC, persistent drawings, CLI and MCP |
 | [Roadmap](ROADMAP.md) | What's done and what's next |
 
 ![Takeoff Desk](images/dark-takeoff.png)

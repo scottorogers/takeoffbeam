@@ -1,0 +1,20 @@
+services:
+  takeoff:
+    build: .
+    platform: linux/amd64
+    image: takeoffbeam-browser:local
+    ports:
+      - "127.0.0.1:${TAKEOFF_PORT:-6080}:6080"
+    volumes:
+      - ./drawings:/drawings
+      - takeoff-home:/home/takeoff
+    shm_size: "512mb"
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  takeoff-home:

@@ -1,0 +1,11 @@
+.git
+target*
+vendor
+dist
+drawings
+marketing
+docs
+node_modules
+.env*
+*.log
+__pycache__

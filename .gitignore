@@ -5,6 +5,10 @@
 !assets/**/*.png
 !docs/**/*.png
 /dist
+/drawings/
+.env
+.env.*
+__pycache__/
 /marketing/footage
 /marketing/*.mp4
 /marketing/launch-video/target

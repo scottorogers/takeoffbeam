@@ -1,0 +1,40 @@
+name: Docker browser desktop
+on:
+  push:
+    branches: [main]
+    paths: [Dockerfile, compose.yaml, .dockerignore, 'docker/**', 'crates/**', Cargo.toml, Cargo.lock, '.github/workflows/docker.yml']
+  pull_request:
+    paths: [Dockerfile, compose.yaml, .dockerignore, 'docker/**', 'crates/**', Cargo.toml, Cargo.lock, '.github/workflows/docker.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: takeoffbeam-browser:local
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Start desktop
+        run: |
+          mkdir -p drawings
+          chmod 0777 drawings
+          docker compose up --no-build -d --wait --wait-timeout 120
+      - name: Exercise PDF and MCP tools
+        run: python3 docker/smoke-test.py
+      - name: Desktop logs
+        if: always()
+        run: docker compose logs --tail=150
+      - name: Stop desktop
+        if: always()
+        run: docker compose down
