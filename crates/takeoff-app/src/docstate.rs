@@ -16,6 +16,7 @@ use takeoff_pdf::outline::Bookmark;
 use takeoff_pdf::search::Hit;
 use takeoff_pdf::FracRect;
 
+use crate::layout::{Arrangement, PageLayout};
 use crate::worker::{Opened, Req, Res, Worker};
 
 pub struct SharpView {
@@ -33,6 +34,10 @@ pub struct CompareState {
 	/// Share of pixels that differ (0–1).
 	pub changed: f32,
 	pub show_overlay: bool,
+	/// Against the page's previous revision (follows to the next revised page).
+	pub revision: bool,
+	/// Items on the parts of the sheet that changed.
+	pub flagged: Vec<String>,
 }
 
 pub struct SearchState {
@@ -128,23 +133,38 @@ pub struct OpenDoc {
 	pub outline: Vec<Bookmark>,
 	pub error: Option<String>,
 
+	/// The current page: the one in front of you (under the view's centre
+	/// when continuous), or the one a tool is working on.
 	pub page: u32,
 	/// Screen points per PDF point.
 	pub zoom: f32,
-	/// Page top-left relative to the canvas top-left, in screen points.
+	/// Page top-left relative to the canvas top-left, in screen points
+	/// (continuous: the layout's origin; spreads: the row's top-left).
 	pub pan: Vec2,
+	/// Single page, continuous, spreads (view only).
+	pub layout: PageLayout,
+	/// Where every page sits for `layout`.
+	pub arr: Arrangement,
+	/// The view the current page was last picked for (continuous).
+	followed: Option<(Vec2, f32, Rect)>,
 	pub fit_pending: bool,
 	pub canvas_rect: Rect,
 
 	pub base: HashMap<u32, TextureHandle>,
-	base_requested: HashSet<u32>,
+	/// Base renders asked for: page → long edge in pixels.
+	base_requested: HashMap<u32, u32>,
+	/// Base renders on their way (continuous asks a few at a time).
+	base_inflight: HashMap<u32, Instant>,
 	pub sharp: Option<SharpView>,
-	sharp_key: Option<(u32, [i64; 4], i64)>,
+	/// Sharp renders of the other pages on screen (continuous, spreads).
+	pub side_sharp: HashMap<u32, SharpView>,
+	sharp_key: Option<Vec<(u32, [i64; 4], i64)>>,
 	view_changed_at: Instant,
 	pub thumbs: HashMap<u32, TextureHandle>,
 	thumbs_requested: HashSet<u32>,
-	pub snap: Option<(u32, Arc<SnapIndex>)>,
-	snap_requested: Option<u32>,
+	/// Snap indexes of the last few pages (the pointer moves between pages when continuous).
+	pub snap: Vec<(u32, Arc<SnapIndex>)>,
+	snap_requested: HashSet<u32>,
 
 	pub selection: HashSet<String>,
 	pub search: Option<SearchState>,
@@ -169,9 +189,16 @@ pub struct OpenDoc {
 	/// Lines followed in the page's picture, by (page, ends); None = no line.
 	traced: HashMap<(u32, [u64; 4]), Option<Vec<Point>>>,
 	traced_requested: HashSet<(u32, [u64; 4])>,
+	/// Fills asked of the worker, by token, once done.
+	filled: HashMap<u64, Option<Result<takeoff_pdf::fill::Fill, takeoff_pdf::fill::NoFill>>>,
+	fill_seq: u64,
 	/// Graph view card images, by key.
 	pub crops: HashMap<String, TextureHandle>,
 	crops_requested: HashSet<String>,
+	/// The PDF file that goes with each undo step (page tools, slip-sheets).
+	pub versions: crate::pdf_undo::PdfVersions,
+	/// Something to tell the user once (the app shows it as a toast).
+	pub notice: Option<(String, bool)>,
 }
 
 impl OpenDoc {
@@ -198,17 +225,22 @@ impl OpenDoc {
 			page: 1,
 			zoom: 1.0,
 			pan: Vec2::ZERO,
+			layout: PageLayout::SINGLE,
+			arr: Arrangement::default(),
+			followed: None,
 			fit_pending: true,
 			canvas_rect: Rect::NOTHING,
 			base: HashMap::new(),
-			base_requested: HashSet::new(),
+			base_requested: HashMap::new(),
+			base_inflight: HashMap::new(),
 			sharp: None,
+			side_sharp: HashMap::new(),
 			sharp_key: None,
 			view_changed_at: Instant::now(),
 			thumbs: HashMap::new(),
 			thumbs_requested: HashSet::new(),
-			snap: None,
-			snap_requested: None,
+			snap: vec![],
+			snap_requested: HashSet::new(),
 			selection: HashSet::new(),
 			search: None,
 			compare: None,
@@ -228,43 +260,45 @@ impl OpenDoc {
 			crops_requested: HashSet::new(),
 			traced: HashMap::new(),
 			traced_requested: HashSet::new(),
+			filled: HashMap::new(),
+			fill_seq: 0,
+			versions: Default::default(),
+			notice: None,
 		})
 	}
 
 	fn on_opened(&mut self, o: Opened) {
-		let page_count_changed = o.page_sizes.len() != self.page_sizes.len();
 		self.page_sizes = o.page_sizes.clone();
 		self.labels = o.labels;
 		self.layers = o.layers;
 		self.outline = o.outline;
 		{
+			// Same document, so the undo history survives the PDF being rewritten.
 			let mut d = self.doc.lock();
-			let data = std::mem::take(&mut d.data);
-			let author = d.author.clone();
-			let rev_dirty = d.is_dirty();
-			*d = Document::new(data, o.page_sizes, author);
+			d.set_page_sizes(o.page_sizes);
 			// Keep the layer registry (names) in the takeoff for platform consumers.
 			for name in &self.layers {
 				if !d.data.layers.iter().any(|l| &l.name == name) {
 					d.data.layers.push(takeoff_core::LayerInfo { name: name.clone(), description: None });
 				}
 			}
-			if !rev_dirty {
-				d.mark_saved();
-			}
 		}
 		self.loaded = true;
 		self.page = self.page.clamp(1, self.page_count().max(1));
-		if page_count_changed {
-			self.thumbs.clear();
-			self.thumbs_requested.clear();
-			self.crops.clear();
-			self.crops_requested.clear();
-		}
+		self.arr = Arrangement::new(&self.page_sizes, self.layout);
+		// Pages may show something else now (rotated, replaced), even at the same count.
+		self.thumbs.clear();
+		self.thumbs_requested.clear();
+		self.crops.clear();
+		self.crops_requested.clear();
 		self.base.clear();
 		self.base_requested.clear();
+		self.base_inflight.clear();
 		self.sharp = None;
+		self.side_sharp.clear();
 		self.sharp_key = None;
+		self.snap.clear();
+		self.snap_requested.clear();
 		self.fit_pending = true;
 	}
 
@@ -286,6 +320,16 @@ impl OpenDoc {
 	/// Drain worker results; returns true when something changed visually.
 	pub fn poll(&mut self, ctx: &egui::Context) -> bool {
 		let mut changed = false;
+		// Undo/redo across a page edit or slip-sheet: put that step's PDF back.
+		let want = self.doc.lock().data.pdf_state;
+		match self.versions.sync(&self.path, want) {
+			Ok(true) => {
+				self.compare = None;
+				self.reload_pdf();
+			}
+			Ok(false) => {}
+			Err(e) => self.notice = Some((e, true)),
+		}
 		while let Ok(r) = self.worker.rx.try_recv() {
 			changed = true;
 			match r {
@@ -293,10 +337,20 @@ impl OpenDoc {
 				Res::Base { page, image } => {
 					let tex = ctx.load_texture(format!("base-{page}"), image, TextureOptions::LINEAR);
 					self.base.insert(page, tex);
+					self.base_inflight.remove(&page);
 				}
 				Res::View { page, region, generation: _, image } => {
-					let tex = ctx.load_texture("sharp", image, TextureOptions::LINEAR);
-					self.sharp = Some(SharpView { page, region, tex, zoom: self.zoom });
+					let tex = ctx.load_texture(format!("sharp-{page}"), image, TextureOptions::LINEAR);
+					let view = SharpView { page, region, tex, zoom: self.zoom };
+					if page == self.page {
+						// The page that was current is still on screen beside it.
+						if let Some(old) = self.sharp.replace(view).filter(|o| o.page != page) {
+							self.side_sharp.insert(old.page, old);
+						}
+						self.side_sharp.remove(&page);
+					} else {
+						self.side_sharp.insert(page, view);
+					}
 				}
 				Res::Thumb { page, image } => {
 					let tex = ctx.load_texture(format!("thumb-{page}"), image, TextureOptions::LINEAR);
@@ -310,9 +364,17 @@ impl OpenDoc {
 					self.traced.insert(trace_key(page, a, b), run);
 					changed = true;
 				}
+				Res::Fill { token, fill } => {
+					self.filled.insert(token, fill);
+				}
 				Res::Segments { page, segments } => {
 					let (w, h) = self.page_size(page);
-					self.snap = Some((page, Arc::new(SnapIndex::new(segments, w, h))));
+					self.snap.retain(|(p, _)| *p != page);
+					self.snap.insert(0, (page, Arc::new(SnapIndex::new(segments, w, h))));
+					if self.snap.len() > 4 {
+						let (gone, _) = self.snap.pop().unwrap();
+						self.snap_requested.remove(&gone);
+					}
 				}
 				Res::Search { generation, hits, done } => {
 					if let Some(s) = &mut self.search {
@@ -325,18 +387,21 @@ impl OpenDoc {
 				Res::LayersApplied => {
 					self.base.clear();
 					self.base_requested.clear();
+					self.base_inflight.clear();
 					self.sharp = None;
+					self.side_sharp.clear();
 					self.sharp_key = None;
 					self.thumbs.clear();
 					self.thumbs_requested.clear();
 					self.crops.clear();
 					self.crops_requested.clear();
 				}
-				Res::Compare { page, image, changed } => {
+				Res::Compare { page, image, changed, grid } => {
 					if let Some(c) = &mut self.compare {
 						if c.page == page {
 							c.tex = Some(ctx.load_texture("compare", image, TextureOptions::LINEAR));
 							c.changed = changed;
+							c.flagged = takeoff_core::slip::items_on_changes(&self.doc.lock().data, page, &grid);
 						}
 					}
 				}
@@ -358,6 +423,28 @@ impl OpenDoc {
 			self.worker.send(Req::Trace { page: self.page, a, b });
 		}
 		None
+	}
+
+	/// Ask for the space around `at` on this page to be filled; the token to
+	/// collect it with [`OpenDoc::take_fill`]. Openings tried are real door
+	/// widths when the page has a scale.
+	pub fn request_fill(&mut self, at: Vec<Point>) -> u64 {
+		let (w, h) = self.page_size(self.page);
+		let pt_per_m = {
+			let d = self.doc.lock();
+			at.first().and_then(|p| d.data.scale_at(self.page, *p)).and_then(|s| {
+				let upp = takeoff_core::geometry::scale_units_per_px(s, w, h)?;
+				takeoff_core::units::length_factor("m", &s.unit).map(|f| f / upp)
+			})
+		};
+		self.fill_seq += 1;
+		self.worker.send(Req::Fill { token: self.fill_seq, page: self.page, at, gaps: takeoff_pdf::fill::gaps(pt_per_m) });
+		self.fill_seq
+	}
+
+	/// The fill asked for with `token`, once the worker is done.
+	pub fn take_fill(&mut self, token: u64) -> Option<Option<Result<takeoff_pdf::fill::Fill, takeoff_pdf::fill::NoFill>>> {
+		self.filled.remove(&token)
 	}
 
 	/// A render of `region` of `page` for a graph card, cached under `key`.
@@ -572,11 +659,10 @@ impl OpenDoc {
 	}
 
 	pub fn ensure_snap(&mut self) -> Option<Arc<SnapIndex>> {
-		match &self.snap {
-			Some((p, idx)) if *p == self.page => Some(idx.clone()),
-			_ => {
-				if self.snap_requested != Some(self.page) {
-					self.snap_requested = Some(self.page);
+		match self.snap.iter().find(|(p, _)| *p == self.page) {
+			Some((_, idx)) => Some(idx.clone()),
+			None => {
+				if self.snap_requested.insert(self.page) {
 					self.worker.send(Req::Segments { page: self.page });
 				}
 				None
@@ -586,9 +672,34 @@ impl OpenDoc {
 
 	// ── View geometry ───────────────────────────────────────────────────
 
+	/// Switch the page layout, keeping the current page where it is on screen.
+	pub fn set_layout(&mut self, layout: PageLayout) {
+		if layout == self.layout {
+			return;
+		}
+		let before = self.page_rect().min;
+		self.layout = layout;
+		self.arr = Arrangement::new(&self.page_sizes, layout);
+		self.pan += before - self.page_rect().min;
+		self.side_sharp.clear();
+		self.sharp_key = None;
+		self.followed = None;
+		self.touch_view();
+	}
+
+	/// Where a page's corner is from the drawn frame's corner, in points.
+	fn offset(&self, page: u32) -> Vec2 {
+		self.arr.rect(page).min.to_vec2() - self.arr.base(self.page)
+	}
+
+	/// Where a page is on screen (meaningful for the pages the layout shows).
+	pub fn page_rect_of(&self, page: u32) -> Rect {
+		let r = self.arr.rect(page);
+		Rect::from_min_size(self.canvas_rect.min + self.pan + self.offset(page) * self.zoom, r.size() * self.zoom)
+	}
+
 	pub fn page_rect(&self) -> Rect {
-		let (w, h) = self.page_size(self.page);
-		Rect::from_min_size(self.canvas_rect.min + self.pan, Vec2::new(w as f32 * self.zoom, h as f32 * self.zoom))
+		self.page_rect_of(self.page)
 	}
 
 	pub fn to_screen(&self, p: Point) -> Pos2 {
@@ -601,6 +712,43 @@ impl OpenDoc {
 		Point { x: ((s.x - r.min.x) / r.width()) as f64, y: ((s.y - r.min.y) / r.height()) as f64 }
 	}
 
+	/// A screen point in layout space.
+	fn to_layout(&self, s: Pos2) -> Pos2 {
+		(self.arr.base(self.page) + (s - self.canvas_rect.min - self.pan) / self.zoom).to_pos2()
+	}
+
+	/// The pages on screen, in page order.
+	pub fn visible_pages(&self) -> Vec<u32> {
+		self.pages_in(self.canvas_rect)
+	}
+
+	/// The pages the layout shows that meet a screen rect.
+	fn pages_in(&self, screen: Rect) -> Vec<u32> {
+		self.arr.visible(self.page, Rect::from_min_max(self.to_layout(screen.min), self.to_layout(screen.max)))
+	}
+
+	/// The page under a screen point (None in the gaps and around the pages).
+	pub fn page_at(&self, s: Pos2) -> Option<u32> {
+		self.arr.page_at(self.page, self.to_layout(s))
+	}
+
+	/// Continuous: once the view has moved, the page under its centre is the
+	/// current one (no history; the selection stays).
+	pub fn follow_view(&mut self) {
+		let key = (self.pan, self.zoom, self.canvas_rect);
+		if !self.layout.continuous || !self.loaded || self.followed == Some(key) {
+			return;
+		}
+		self.followed = Some(key);
+		self.page = self.arr.page_for_centre(self.page, self.to_layout(self.canvas_rect.center()));
+	}
+
+	/// Pan so the point `local` points from `page`'s corner is at `at` (canvas-relative).
+	fn place(&mut self, page: u32, local: Vec2, at: Vec2) {
+		self.pan = at - (self.offset(page) + local) * self.zoom;
+		self.touch_view();
+	}
+
 	/// Screen points per page fraction, x and y.
 	pub fn frac_scale(&self) -> (f32, f32) {
 		let r = self.page_rect();
@@ -608,27 +756,47 @@ impl OpenDoc {
 	}
 
 	pub fn fit_page(&mut self) {
-		let (w, h) = self.page_size(self.page);
+		let r = self.arr.row_rect(self.page);
 		let avail = self.canvas_rect.size() - Vec2::splat(48.0);
 		if avail.x <= 0.0 || avail.y <= 0.0 {
 			return;
 		}
-		self.zoom = (avail.x / w as f32).min(avail.y / h as f32).clamp(0.02, 64.0);
+		self.zoom = (avail.x / r.width()).min(avail.y / r.height()).clamp(0.02, 64.0);
 		self.center_page();
 	}
 
 	pub fn fit_width(&mut self) {
-		let (w, _) = self.page_size(self.page);
-		self.zoom = ((self.canvas_rect.width() - 48.0) / w as f32).clamp(0.02, 64.0);
+		let r = self.arr.row_rect(self.page);
+		self.zoom = ((self.canvas_rect.width() - 48.0) / r.width()).clamp(0.02, 64.0);
+		if self.layout.continuous {
+			self.scroll_to(self.page);
+			return;
+		}
 		self.center_page();
 		self.pan.y = 24.0;
 	}
 
+	/// Centre the current page (its spread, with spreads).
 	pub fn center_page(&mut self) {
-		let (w, h) = self.page_size(self.page);
-		let size = Vec2::new(w as f32, h as f32) * self.zoom;
-		self.pan = (self.canvas_rect.size() - size) / 2.0;
-		self.touch_view();
+		let r = self.arr.row_rect(self.page);
+		let corner = r.min - self.arr.rect(self.page).min;
+		self.place(self.page, corner, (self.canvas_rect.size() - r.size() * self.zoom) / 2.0);
+	}
+
+	/// Continuous: bring a page into view at this zoom, its row centred when
+	/// it fits, else its top near the top, so the view's centre is on it.
+	fn scroll_to(&mut self, page: u32) {
+		let (row, p) = (self.arr.row_rect(page), self.arr.rect(page));
+		let (c, s) = (self.canvas_rect.size(), row.size() * self.zoom);
+		let y = if s.y <= c.y - 48.0 { (c.y - s.y) / 2.0 } else { 24.0 };
+		let (x, at_x) = if s.x <= c.x - 48.0 {
+			(row.min.x, (c.x - s.x) / 2.0)
+		} else if p.width() * self.zoom <= c.x - 48.0 {
+			(p.min.x, (c.x - p.width() * self.zoom) / 2.0)
+		} else {
+			(p.min.x, 24.0)
+		};
+		self.place(page, Pos2::new(x, row.min.y) - p.min, Vec2::new(at_x, y));
 	}
 
 	/// Zoom by `factor` keeping `anchor` (screen) fixed.
@@ -648,8 +816,8 @@ impl OpenDoc {
 		let (rw, rh) = ((region.2.max(0.01) * w) as f32, (region.3.max(0.01) * h) as f32);
 		let avail = self.canvas_rect.size();
 		self.zoom = (avail.x * 0.6 / rw).min(avail.y * 0.6 / rh).clamp(0.05, 24.0);
-		let center = Vec2::new(((region.0 + region.2 / 2.0) * w) as f32, ((region.1 + region.3 / 2.0) * h) as f32) * self.zoom;
-		self.pan = avail / 2.0 - center;
+		let center = Vec2::new(((region.0 + region.2 / 2.0) * w) as f32, ((region.1 + region.3 / 2.0) * h) as f32);
+		self.place(self.page, center, avail / 2.0);
 		self.fit_pending = false;
 		self.touch_view();
 	}
@@ -661,10 +829,17 @@ impl OpenDoc {
 			if self.history.len() > 50 {
 				self.history.remove(0);
 			}
-			let keep_zoom = self.page_size(page) == self.page_size(self.page);
+			let (was, row) = (self.arr.row_rect(self.page), self.arr.row_rect(page));
+			let same_row = self.arr.row(page) == self.arr.row(self.page);
 			self.page = page;
 			self.selection.clear();
-			if keep_zoom {
+			if self.layout.continuous {
+				// Every page is laid out already: scroll there, keeping the zoom.
+				if !same_row {
+					self.scroll_to(page);
+				}
+				self.touch_view();
+			} else if was.size() == row.size() {
 				self.touch_view();
 			} else {
 				self.fit_pending = true;
@@ -688,65 +863,138 @@ impl OpenDoc {
 		let page = self.page;
 		let max_tex = ctx.input(|i| i.max_texture_side).max(1024) as u32;
 		let base_px = 2400.min(max_tex);
-		if !self.base.contains_key(&page) && self.base_requested.insert(page) {
+		let ppp = ctx.pixels_per_point();
+		if self.layout.multi() {
+			self.request_bases(base_px, ppp);
+		} else if self.base_requested.get(&page).is_none_or(|px| *px < base_px) {
+			self.base_requested.insert(page, base_px);
 			self.worker.send(Req::Base { page, max_px: base_px });
 			// Neighbours too, so paging feels instant.
 			for p in [page + 1, page.saturating_sub(1)] {
-				if p >= 1 && p <= self.page_count() && self.base_requested.insert(p) {
+				if p >= 1 && p <= self.page_count() && self.base_requested.get(&p).is_none_or(|px| *px < base_px) {
+					self.base_requested.insert(p, base_px);
 					self.worker.send(Req::Base { page: p, max_px: base_px });
 				}
 			}
 		}
-		// Sharp render of what's visible, once the view has settled.
-		let ppp = ctx.pixels_per_point();
-		let pr = self.page_rect();
-		let vis = pr.intersect(self.canvas_rect);
-		if vis.width() <= 1.0 || vis.height() <= 1.0 {
-			return;
+		// Sharp renders of what's visible, once the view has settled.
+		let mut want = Vec::new();
+		for pg in self.visible_pages() {
+			let pr = self.page_rect_of(pg);
+			let vis = pr.intersect(self.canvas_rect);
+			if vis.width() <= 1.0 || vis.height() <= 1.0 {
+				continue;
+			}
+			// Skip when the base texture is already sharp enough.
+			if pr.width().max(pr.height()) * ppp <= base_px as f32 * 1.05 {
+				if pg == page {
+					self.sharp = None;
+				}
+				self.side_sharp.remove(&pg);
+				continue;
+			}
+			// Render a little beyond the visible area so small pans stay sharp.
+			let pad = Vec2::new(vis.width(), vis.height()) * 0.15;
+			let area = vis.expand2(pad).intersect(pr);
+			let region = FracRect {
+				x: ((area.min.x - pr.min.x) / pr.width()) as f64,
+				y: ((area.min.y - pr.min.y) / pr.height()) as f64,
+				w: (area.width() / pr.width()) as f64,
+				h: (area.height() / pr.height()) as f64,
+			};
+			let mut px = ((area.width() * ppp) as u32, (area.height() * ppp) as u32);
+			let cap = max_tex.min(6000) as f32 / px.0.max(px.1) as f32;
+			if cap < 1.0 {
+				px = ((px.0 as f32 * cap) as u32, (px.1 as f32 * cap) as u32);
+			}
+			want.push((pg, region, (px.0.max(1), px.1.max(1))));
 		}
-		// Skip when the base texture is already sharp enough.
-		if pr.width().max(pr.height()) * ppp <= base_px as f32 * 1.05 {
-			self.sharp = None;
+		self.side_sharp.retain(|p, _| want.iter().any(|w| w.0 == *p));
+		if want.is_empty() {
 			return;
 		}
 		if self.view_changed_at.elapsed() < Duration::from_millis(140) {
 			ctx.request_repaint_after(Duration::from_millis(150));
 			return;
 		}
-		// Render a little beyond the visible area so small pans stay sharp.
-		let pad = Vec2::new(vis.width(), vis.height()) * 0.15;
-		let want = vis.expand2(pad).intersect(pr);
-		let region = FracRect {
-			x: ((want.min.x - pr.min.x) / pr.width()) as f64,
-			y: ((want.min.y - pr.min.y) / pr.height()) as f64,
-			w: (want.width() / pr.width()) as f64,
-			h: (want.height() / pr.height()) as f64,
-		};
-		let key = (page, [region.x, region.y, region.w, region.h].map(|v| (v * 20_000.0) as i64), (self.zoom * 1000.0) as i64);
-		if self.sharp_key == Some(key) {
+		// The current page first.
+		want.sort_by_key(|w| w.0 != page);
+		let key: Vec<_> = want.iter().map(|(pg, r, _)| (*pg, [r.x, r.y, r.w, r.h].map(|v| (v * 20_000.0) as i64), (self.zoom * 1000.0) as i64)).collect();
+		if self.sharp_key.as_ref() == Some(&key) {
 			return;
 		}
 		self.sharp_key = Some(key);
-		let mut px = ((want.width() * ppp) as u32, (want.height() * ppp) as u32);
-		let cap = max_tex.min(6000) as f32 / px.0.max(px.1) as f32;
-		if cap < 1.0 {
-			px = ((px.0 as f32 * cap) as u32, (px.1 as f32 * cap) as u32);
+		self.worker.views(want);
+	}
+
+	/// Continuous / spreads: base renders for the pages on screen and a
+	/// screen's height around them, nearest first and a few at a time, sized
+	/// to the page on screen (a thumbnail when it is tiny). Textures far
+	/// from the view are let go, so scrolling a long set doesn't fill memory.
+	fn request_bases(&mut self, base_px: u32, ppp: f32) {
+		let now = Instant::now();
+		self.base_inflight.retain(|_, t| now.duration_since(*t) < Duration::from_secs(5));
+		let mut near = self.pages_in(self.canvas_rect.expand2(Vec2::new(0.0, self.canvas_rect.height())));
+		let c = self.canvas_rect.center();
+		let dist = |d: &Self, p: u32| (d.page_rect_of(p).center() - c).length();
+		near.sort_by(|a, b| dist(self, *a).total_cmp(&dist(self, *b)));
+		for &pg in &near {
+			if self.base_inflight.len() >= 3 {
+				break;
+			}
+			let r = self.page_rect_of(pg);
+			let edge = r.width().max(r.height()) * ppp;
+			if edge <= 240.0 && !self.base.contains_key(&pg) {
+				self.thumb(pg);
+				continue;
+			}
+			let px = [600, 1200].into_iter().find(|t| *t as f32 >= edge).unwrap_or(base_px).min(base_px);
+			if self.base_requested.get(&pg).is_some_and(|had| *had >= px) {
+				continue;
+			}
+			self.base_requested.insert(pg, px);
+			self.base_inflight.insert(pg, now);
+			self.worker.send(Req::Base { page: pg, max_px: px });
 		}
-		self.worker.view(page, region, (px.0.max(1), px.1.max(1)));
+		if self.base.len() > 32 {
+			let keep: HashSet<u32> = near.iter().copied().chain([self.page]).collect();
+			self.base.retain(|p, _| keep.contains(p));
+			let inflight = &self.base_inflight;
+			self.base_requested.retain(|p, _| keep.contains(p) || inflight.contains_key(p));
+		}
 	}
 
 	/// Start (or retarget) a revision compare against another PDF page.
 	pub fn start_compare(&mut self, other: PathBuf, other_page: u32, ctx: &egui::Context) {
 		let max_px = 3000.min(ctx.input(|i| i.max_texture_side) as u32);
 		self.worker.send(Req::Compare { page: self.page, other: other.clone(), other_page, max_px });
-		self.compare = Some(CompareState { other, other_page, page: self.page, tex: None, changed: 0.0, show_overlay: true });
+		self.compare = Some(CompareState { other, other_page, page: self.page, tex: None, changed: 0.0, show_overlay: true, revision: false, flagged: vec![] });
 	}
 
-	/// Keep the compare in step with page changes (same page number in both files).
+	/// Compare this page with the revision it replaced; false when it has none (or its file is gone).
+	pub fn compare_previous(&mut self, ctx: &egui::Context) -> bool {
+		let Some(r) = self.doc.lock().data.previous_revision(self.page).cloned() else { return false };
+		let file = takeoff_pdf::slip::history_path(&self.path, &r);
+		if !file.exists() {
+			return false;
+		}
+		self.start_compare(file, r.file_page, ctx);
+		if let Some(c) = &mut self.compare {
+			c.revision = true;
+		}
+		true
+	}
+
+	/// Keep the compare in step with page changes (same page number in both
+	/// files; a revision compare moves to that page's previous revision).
 	pub fn update_compare(&mut self, ctx: &egui::Context) {
 		let needs = self.compare.as_ref().is_some_and(|c| c.page != self.page);
 		if needs {
 			let c = self.compare.take().unwrap();
+			if c.revision {
+				self.compare_previous(ctx);
+				return;
+			}
 			let delta = self.page as i64 - c.page as i64;
 			let other_page = (c.other_page as i64 + delta).max(1) as u32;
 			self.start_compare(c.other, other_page, ctx);

@@ -250,7 +250,7 @@ impl ToolCtx {
 		v
 	}
 
-	fn view(&self, id: &str) -> Result<View, String> {
+	pub(crate) fn view(&self, id: &str) -> Result<View, String> {
 		let id = id.trim();
 		let id = if id.starts_with('v') { id.to_string() } else { format!("v{id}") };
 		self.views.iter().rev().find(|v| v.id == id).cloned().ok_or_else(|| {
@@ -387,8 +387,16 @@ pub(crate) fn drop_filler(args: Value) -> Value {
 	Value::Object(obj)
 }
 
-/// Run one tool.
+/// Run one tool. A panic in it (a bug met on an odd drawing or reply) comes
+/// back as the tool's error, so the turn carries on and the thread lives.
 pub fn call(ctx: &mut ToolCtx, name: &str, args: Value) -> Result<ToolOutput, String> {
+	std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(ctx, name, args))).unwrap_or_else(|why| {
+		let why = why.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| why.downcast_ref::<String>().cloned()).unwrap_or_default();
+		Err(format!("{name} hit an internal error ({why}). Try another way; tell the estimator if it keeps happening."))
+	})
+}
+
+fn dispatch(ctx: &mut ToolCtx, name: &str, args: Value) -> Result<ToolOutput, String> {
 	// Models sometimes send the arguments as a JSON string.
 	let args = match args {
 		Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
@@ -413,6 +421,7 @@ pub fn call(ctx: &mut ToolCtx, name: &str, args: Value) -> Result<ToolOutput, St
 		"find_items_at" => items::find_items_at(ctx, parse(name, args)?),
 		"add_marks" => items::add_marks(ctx, parse(name, args)?),
 		"add_measurements" => items::add_measurements(ctx, parse(name, args)?),
+		"fill_area" => items::fill_area(ctx, parse(name, args)?),
 		"update_items" => items::update_items(ctx, parse(name, args)?),
 		"delete_items" => items::delete_items(ctx, parse(name, args)?),
 		"create_category" => items::create_category(ctx, parse(name, args)?),

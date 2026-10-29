@@ -16,6 +16,8 @@ pub enum Tool {
 	Trace,
 	Perimeter,
 	Area,
+	/// The space around the point clicked, outlined along the drawn lines.
+	Fill,
 	RectArea,
 	Volume,
 	Cutout,
@@ -26,6 +28,12 @@ pub enum Tool {
 	Annot(AnnotationKind),
 	/// A curved line markup (stored as a polyline along the curve).
 	CurveMarkup,
+	/// A named region quantities are attributed to, clicked corner by corner.
+	Space,
+	/// A space outlined along the drawn lines around the point clicked.
+	SpaceFill,
+	/// A markup legend box.
+	Legend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +44,9 @@ pub enum Group {
 }
 
 impl Tool {
-	pub const MEASURE: [Tool; 13] = [Tool::Count, Tool::Length, Tool::Curve, Tool::Trace, Tool::Perimeter, Tool::Area, Tool::RectArea, Tool::Volume, Tool::Cutout, Tool::Angle, Tool::FollowLine, Tool::Calibrate, Tool::Viewport];
+	pub const MEASURE: [Tool; 14] = [Tool::Count, Tool::Length, Tool::Curve, Tool::Trace, Tool::Perimeter, Tool::Area, Tool::Fill, Tool::RectArea, Tool::Volume, Tool::Cutout, Tool::Angle, Tool::FollowLine, Tool::Calibrate, Tool::Viewport];
+	/// Not on the toolbar (it's full): started from the Takeoff tab.
+	pub const ORGANIZE: [Tool; 3] = [Tool::Space, Tool::SpaceFill, Tool::Legend];
 	pub const MARKUP: [Tool; 13] = [
 		Tool::Annot(AnnotationKind::Text),
 		Tool::Annot(AnnotationKind::Callout),
@@ -64,6 +74,7 @@ impl Tool {
 			Tool::CurveMarkup => "Curve",
 			Tool::Perimeter => "Perimeter",
 			Tool::Area => "Area",
+			Tool::Fill => "Fill Area",
 			Tool::RectArea => "Rectangle Area",
 			Tool::Volume => "Volume",
 			Tool::Cutout => "Cutout",
@@ -71,6 +82,9 @@ impl Tool {
 			Tool::Calibrate => "Calibrate",
 			Tool::Viewport => "Viewport",
 			Tool::FollowLine => "Follow Line",
+			Tool::Space => "Space",
+			Tool::SpaceFill => "Fill Space",
+			Tool::Legend => "Legend",
 			Tool::Annot(k) => k.label(),
 		}
 	}
@@ -85,6 +99,7 @@ impl Tool {
 			Tool::Trace => i::ROUTE,
 			Tool::Perimeter => i::WAYPOINTS,
 			Tool::Area => i::PENTAGON,
+			Tool::Fill => i::PAINT_BUCKET,
 			Tool::RectArea => i::SQUARE_DASHED,
 			Tool::Volume => i::BOX,
 			Tool::Cutout => i::SCISSORS,
@@ -92,6 +107,9 @@ impl Tool {
 			Tool::Calibrate => i::SCALING,
 			Tool::Viewport => i::FRAME,
 			Tool::FollowLine => i::SCAN,
+			Tool::Space => i::LASSO,
+			Tool::SpaceFill => i::SQUARE_DOT,
+			Tool::Legend => i::TABLE,
 			Tool::Annot(k) => match k {
 				AnnotationKind::Text => i::TYPE,
 				AnnotationKind::Callout => i::MESSAGE_SQUARE_TEXT,
@@ -112,7 +130,7 @@ impl Tool {
 	pub fn shortcut(self) -> Option<char> {
 		Some(match self {
 			// Every letter is taken.
-			Tool::Curve | Tool::Trace | Tool::CurveMarkup => return None,
+			Tool::Curve | Tool::Trace | Tool::CurveMarkup | Tool::Fill | Tool::Space | Tool::SpaceFill | Tool::Legend => return None,
 			Tool::Select => 'V',
 			Tool::Pan => 'H',
 			Tool::Count => 'C',
@@ -153,12 +171,16 @@ impl Tool {
 			Tool::Trace => "Click points ON a drawn line (start, end, where it forks) · it follows the line between them · double-click or Enter to finish",
 			Tool::CurveMarkup => "Click points along the curve · double-click to finish",
 			Tool::Area | Tool::Volume => "Click the corners · double-click or Enter to close",
+			Tool::Fill => "Click inside a room or space to measure it (doorways close by themselves) · Shift-click another piece to add it",
 			Tool::RectArea => "Drag a rectangle",
 			Tool::Cutout => "Select an area first, then click the hole's corners",
 			Tool::Angle => "Click arm, vertex, arm",
 			Tool::Calibrate => "Click both ends of a known dimension",
 			Tool::Viewport => "Drag around a detail drawn at a different scale",
 			Tool::FollowLine => "Click a line on the drawing to measure the whole run",
+			Tool::Space => "Click the corners of a level, unit or room · double-click or Enter to close · quantities inside belong to it",
+			Tool::SpaceFill => "Click inside a room to make it a space, outlined along the drawn lines",
+			Tool::Legend => "Drag a box for a legend of the items on this page",
 			Tool::Annot(AnnotationKind::Polyline | AnnotationKind::Polygon | AnnotationKind::Cloud) => "Click points · double-click to finish",
 			Tool::Annot(AnnotationKind::Callout) => "Drag the text box, then click where the leader points",
 			Tool::Annot(AnnotationKind::Ink) => "Draw freehand",
@@ -171,7 +193,7 @@ impl Tool {
 		match self {
 			Tool::Count => Some(CategoryKind::Count),
 			Tool::Length | Tool::Curve | Tool::Trace | Tool::Perimeter | Tool::FollowLine => Some(CategoryKind::Length),
-			Tool::Area | Tool::RectArea | Tool::Volume => Some(CategoryKind::Area),
+			Tool::Area | Tool::Fill | Tool::RectArea | Tool::Volume => Some(CategoryKind::Area),
 			_ => None,
 		}
 	}
@@ -179,7 +201,7 @@ impl Tool {
 	pub fn group(self) -> Group {
 		match self {
 			Tool::Select | Tool::Pan => Group::Navigate,
-			Tool::Annot(_) | Tool::CurveMarkup => Group::Markup,
+			Tool::Annot(_) | Tool::CurveMarkup | Tool::Legend => Group::Markup,
 			_ => Group::Measure,
 		}
 	}
@@ -188,7 +210,7 @@ impl Tool {
 	pub fn is_multi_point(self) -> bool {
 		matches!(
 			self,
-			Tool::Length | Tool::Curve | Tool::Trace | Tool::Perimeter | Tool::Area | Tool::Volume | Tool::Cutout | Tool::Angle | Tool::Calibrate | Tool::CurveMarkup
+			Tool::Length | Tool::Curve | Tool::Trace | Tool::Perimeter | Tool::Area | Tool::Volume | Tool::Cutout | Tool::Angle | Tool::Calibrate | Tool::CurveMarkup | Tool::Space
 				| Tool::Annot(AnnotationKind::Polyline | AnnotationKind::Polygon | AnnotationKind::Cloud)
 		)
 	}
@@ -196,12 +218,12 @@ impl Tool {
 	pub fn snaps(self) -> bool {
 		matches!(
 			self,
-			Tool::Length | Tool::Curve | Tool::Trace | Tool::CurveMarkup | Tool::Perimeter | Tool::Area | Tool::Volume | Tool::Cutout | Tool::Angle | Tool::Calibrate | Tool::RectArea | Tool::Viewport | Tool::Count
+			Tool::Length | Tool::Curve | Tool::Trace | Tool::CurveMarkup | Tool::Perimeter | Tool::Area | Tool::Volume | Tool::Cutout | Tool::Angle | Tool::Calibrate | Tool::RectArea | Tool::Viewport | Tool::Count | Tool::Space
 				| Tool::Annot(AnnotationKind::Line | AnnotationKind::Arrow | AnnotationKind::Polyline | AnnotationKind::Polygon)
 		)
 	}
 
 	pub fn all() -> impl Iterator<Item = Tool> {
-		[Tool::Select, Tool::Pan].into_iter().chain(Tool::MEASURE).chain(Tool::MARKUP)
+		[Tool::Select, Tool::Pan].into_iter().chain(Tool::MEASURE).chain(Tool::MARKUP).chain(Tool::ORGANIZE)
 	}
 }

@@ -19,7 +19,7 @@ a local model on your machine, or on cloud models if you sign in to
 
 **Download:**
 - [macOS (Apple silicon)](https://pub-061018a047d54079b309fb16a26a1ce0.r2.dev/takeoff-desk/latest/Takeoff-Desk-arm64.dmg), signed and notarized
-- [Windows 10/11 (x64)](https://pub-061018a047d54079b309fb16a26a1ce0.r2.dev/takeoff-desk/latest/Takeoff-Desk-x64-setup.exe), not code-signed yet (signing is coming): Windows SmartScreen asks first, choose *More info → Run anyway*
+- [Windows 10/11 (x64)](https://pub-061018a047d54079b309fb16a26a1ce0.r2.dev/takeoff-desk/latest/Takeoff-Desk-x64-setup.exe), not code-signed yet (SmartScreen: *More info → Run anyway*); installs for you alone without admin rights
 
 These links always point at the newest version.
 
@@ -30,11 +30,13 @@ These links always point at the newest version.
   - Items with colors, hatches, unit costs and a Tool Chest.
 - **Markups:**
   - Text, callouts, clouds, shapes, arrows, highlight, pen and stamps.
-  - A Bluebeam-style Markups List with custom columns and CSV export.
+  - A Bluebeam-style Markups List with custom columns and CSV and Excel export.
 - **PDF tools:**
   - Split, merge, extract, insert, rotate, delete and reorder pages. The takeoff follows its
     pages.
   - Compare revisions, layers, text search and bookmarks.
+  - Slip-sheet a new revision over the old sheets (matched by sheet number, takeoff carried
+    across, old pages kept for Compare), and group drawings into sets.
   - Flattened marked-up PDF export.
 - **AI agent:**
   - Drawing tools, plus a shell in one workspace folder you choose (or turn off). Overlays of
@@ -45,6 +47,8 @@ These links always point at the newest version.
 - **For other tools:**
   - The `takeoff` CLI.
   - An MCP server, so Claude Desktop or Cursor can work a drawing.
+  - A Claude Code plugin: `/plugin marketplace add constructionlive/takeoffbeam`, then
+    `/plugin install takeoff-beam@takeoffbeam`. See [claude-plugin](claude-plugin/README.md).
 - **Native and small:**
   - Rust, egui and pdfium. A 46 MB macOS download.
   - An 859-page set opens in 21 ms, and a full sheet renders in about 50 ms.
@@ -58,7 +62,7 @@ These links always point at the newest version.
   the CLI; opens at `http://localhost:6080`.
 
 - **macOS (Apple silicon):** [Takeoff-Desk-arm64.dmg](https://pub-061018a047d54079b309fb16a26a1ce0.r2.dev/takeoff-desk/latest/Takeoff-Desk-arm64.dmg), signed and notarized by Neuratwin Inc.
-- **Windows 10/11 (x64):** [Takeoff-Desk-x64-setup.exe](https://pub-061018a047d54079b309fb16a26a1ce0.r2.dev/takeoff-desk/latest/Takeoff-Desk-x64-setup.exe). Not code-signed yet; signing is coming in a later release. Until then Windows SmartScreen shows *Windows protected your PC* with an unknown publisher: choose *More info → Run anyway*.
+- **Windows 10/11 (x64):** [Takeoff-Desk-x64-setup.exe](https://pub-061018a047d54079b309fb16a26a1ce0.r2.dev/takeoff-desk/latest/Takeoff-Desk-x64-setup.exe). Not code-signed yet, so SmartScreen asks first (*More info → Run anyway*). Installs for everyone or only for you; only-for-you needs no admin rights. Silent: `/S /CurrentUser`.
 - **From source:** `scripts/fetch-pdfium.sh && cargo run --release -p takeoff-app`.
 
 See the [docs](docs/README.md):
@@ -73,7 +77,7 @@ See the [docs](docs/README.md):
 
 | Crate | |
 |---|---|
-| `takeoff-core` | Data model, geometry, numbering, snapping, coordinate dialects, undo, CSV, sidecar |
+| `takeoff-core` | Data model, geometry, numbering, snapping, coordinate dialects, undo, CSV and Excel, sidecar |
 | `takeoff-pdf` | pdfium rendering, text, layers, vectors, page tools, burn-in, flattened export |
 | `takeoff-models` | GGUF reader, memory-fit check, model catalog, downloads, llama-server |
 | `takeoff-cloud` | construction.live sign-in and cloud models |

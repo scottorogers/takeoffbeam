@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use takeoff_core::geometry::{bounds, iou, point_segment_distance_px};
+use takeoff_core::geometry::{bounds, iou, point_segment_distance_px, scale_units_per_px};
 use takeoff_core::numbering::{mark_seq, measurement_seq};
 use takeoff_core::*;
 
@@ -36,6 +36,15 @@ pub(crate) fn resolve_category(ctx: &ToolCtx, key: &str, kind: CategoryKind, cre
 	Ok(id)
 }
 
+/// A space by id or name (any case).
+fn resolve_space(d: &TakeoffData, key: &str) -> Result<String, String> {
+	if let Some(s) = d.spaces.iter().find(|s| s.id == key || s.name.eq_ignore_ascii_case(key.trim())) {
+		return Ok(s.id.clone());
+	}
+	let names: Vec<String> = d.spaces.iter().map(|s| format!("{} ({}, p{})", s.name, s.id, s.page)).collect();
+	Err(format!("no space '{key}'. Existing: {}", if names.is_empty() { "none".into() } else { names.join(", ") }))
+}
+
 fn changed(ctx: &ToolCtx) {
 	ctx.emit(AgentEvent::DocChanged);
 }
@@ -48,6 +57,8 @@ pub struct ReadItemsArgs {
 	pub category: Option<String>,
 	/// mark | measurement | annotation
 	pub kind: Option<String>,
+	/// Space id or name: only items in it (or in spaces inside it).
+	pub space: Option<String>,
 	pub offset: Option<usize>,
 }
 
@@ -55,8 +66,8 @@ pub fn read_items(ctx: &mut ToolCtx, a: ReadItemsArgs) -> Result<ToolOutput, Str
 	let doc = ctx.doc.lock();
 	let d = &doc.data;
 	let cat = a.category.as_deref().and_then(|k| d.categories.iter().find(|c| c.id == k || c.name.eq_ignore_ascii_case(k)).map(|c| c.id.clone()));
-	if a.category.is_some() && cat.is_none() {
-		return Err(format!("no category '{}'", a.category.unwrap()));
+	if let (Some(k), None) = (&a.category, &cat) {
+		return Err(format!("no category '{k}'"));
 	}
 	let cat_ok = |c: &Option<String>| cat.as_ref().is_none_or(|w| c.as_ref() == Some(w));
 	let page_ok = |p: u32| a.page.is_none_or(|w| w == p);
@@ -64,22 +75,38 @@ pub fn read_items(ctx: &mut ToolCtx, a: ReadItemsArgs) -> Result<ToolOutput, Str
 	let mseq = mark_seq(&d.marks);
 	let sseq = measurement_seq(&d.measurements);
 	let cname = |c: &Option<String>| c.as_deref().and_then(|id| d.category(id)).map(|c| c.name.as_str()).unwrap_or("ungrouped").to_string();
+	let spaces = takeoff_core::spaces::Spaces::new(d);
+	let within = a.space.as_deref().map(|k| resolve_space(d, k)).transpose()?;
+	let space_ok = |s: Option<&Space>| within.as_deref().is_none_or(|w| spaces.is_within(s.map(|s| s.id.as_str()), w));
+	let path = |s: Option<&Space>| s.map(|s| spaces.path_name(&s.id));
 	let mut rows: Vec<Value> = Vec::new();
 	if kind.is_empty() || kind.starts_with("mark") {
 		for m in d.marks.iter().filter(|m| page_ok(m.page) && cat_ok(&m.category_id)) {
-			rows.push(json!({"id": m.id, "kind": "mark", "badge": mseq.get(&m.id), "category": cname(&m.category_id), "page": m.page,
+			let s = spaces.of_mark(m);
+			if !space_ok(s) {
+				continue;
+			}
+			rows.push(json!({"id": m.id, "kind": "mark", "badge": mseq.get(&m.id), "category": cname(&m.category_id), "page": m.page, "space": path(s),
 				"at": [r3(m.x), r3(m.y), r3(m.w), r3(m.h)], "status": format!("{:?}", m.status).to_lowercase(), "source": format!("{:?}", m.source).to_lowercase(), "note": m.note}));
 		}
 	}
 	if kind.is_empty() || kind.starts_with("measure") {
 		for m in d.measurements.iter().filter(|m| page_ok(m.page) && cat_ok(&m.category_id)) {
-			rows.push(json!({"id": m.id, "kind": format!("{:?}", m.kind).to_lowercase(), "badge": sseq.get(&m.id), "category": cname(&m.category_id), "page": m.page,
+			let s = spaces.of_measurement(m);
+			if !space_ok(s) {
+				continue;
+			}
+			rows.push(json!({"id": m.id, "kind": format!("{:?}", m.kind).to_lowercase(), "badge": sseq.get(&m.id), "category": cname(&m.category_id), "page": m.page, "space": path(s),
 				"points": m.points.len(), "value": m.value.map(r3), "unit": m.unit, "label": m.label, "note": m.note}));
 		}
 	}
 	if kind.is_empty() || kind.starts_with("annot") {
 		for an in d.annotations.iter().filter(|x| page_ok(x.page)) {
-			rows.push(json!({"id": an.id, "kind": an.kind.label(), "page": an.page, "text": an.text}));
+			let s = spaces.of_annotation(an);
+			if !space_ok(s) {
+				continue;
+			}
+			rows.push(json!({"id": an.id, "kind": an.kind.label(), "page": an.page, "space": path(s), "text": an.text}));
 		}
 	}
 	let total = rows.len();
@@ -146,7 +173,7 @@ pub fn find_items_at(ctx: &mut ToolCtx, a: FindArgs) -> Result<ToolOutput, Strin
 			}
 		}
 	}
-	hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+	hits.sort_by(|a, b| a.0.total_cmp(&b.0));
 	if hits.is_empty() {
 		return Ok(ToolOutput::text("No items at that location."));
 	}
@@ -414,6 +441,116 @@ pub fn add_measurements(ctx: &mut ToolCtx, a: AddMeasurementsArgs) -> Result<Too
 	Ok(out)
 }
 
+// ── fill_area ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct FillItem {
+	/// One point inside the space, or several that fill together as one.
+	pub points: Vec<Value>,
+	/// area (default) | perimeter
+	#[serde(rename = "type")]
+	pub kind: Option<String>,
+	/// Widest opening to close, in the page's scale unit; default: found.
+	pub gap: Option<f64>,
+	pub label: Option<String>,
+	pub note: Option<String>,
+	pub depth: Option<f64>,
+}
+
+#[derive(Deserialize)]
+pub struct FillArgs {
+	pub view: String,
+	pub items: Vec<FillItem>,
+	pub category: Option<String>,
+}
+
+/// Measure spaces by a point inside each: the outline the drawn lines make
+/// around it, doorways and other openings closed.
+pub fn fill_area(ctx: &mut ToolCtx, a: FillArgs) -> Result<ToolOutput, String> {
+	let v = ctx.view(&a.view)?;
+	if a.items.is_empty() || a.items.len() > 30 {
+		return Err("give 1-30 items".into());
+	}
+	let (w, h) = ctx.doc.lock().page_size_pt(v.page);
+	let mut shapes = Vec::new();
+	let mut lines = Vec::new();
+	for (k, it) in a.items.iter().enumerate() {
+		let perimeter = match it.kind.as_deref().map(str::to_lowercase).as_deref() {
+			None | Some("area") => false,
+			Some("perimeter") => true,
+			Some(other) => return Err(format!("unknown type '{other}' (area, perimeter)")),
+		};
+		let pts: Vec<Point> = it.points.iter().map(|p| view_point_to_page(&v, p)).collect::<Result<_, _>>()?;
+		if pts.is_empty() {
+			return Err(format!("item {}: give a point inside the space", k + 1));
+		}
+		// Openings to try: real door widths at the page's scale; or the one asked for.
+		let pt_per_unit = {
+			let doc = ctx.doc.lock();
+			doc.data.scale_at(v.page, pts[0]).and_then(|s| scale_units_per_px(s, w, h).map(|u| (1.0 / u, s.unit.clone())))
+		};
+		let gaps = match (it.gap, &pt_per_unit) {
+			(Some(g), Some((p, _))) => vec![g * p],
+			(Some(_), None) => return Err("gap is in the scale unit, and this page has no scale yet: leave it out".into()),
+			(None, Some((p, unit))) => takeoff_pdf::fill::gaps(takeoff_core::units::length_factor("m", unit).map(|f| f * p)),
+			(None, None) => takeoff_pdf::fill::gaps(None),
+		};
+		match ctx.drawing.fill_area(v.page, &pts, &gaps).map_err(|e| e.to_string())? {
+			Ok(f) => {
+				let how = if f.gap_pt > 0.0 { format!(", openings up to {:.0} pt of paper closed", f.gap_pt) } else { String::new() };
+				shapes.push((k, perimeter, f.points, it, how));
+			}
+			Err(takeoff_pdf::fill::NoFill::OnLine) => lines.push(format!("item {}: that point is on the line work, not in a space; put it in the open paper inside", k + 1)),
+			Err(takeoff_pdf::fill::NoFill::Open) => lines.push(format!("item {}: no closed outline around that point (the lines leave it open to the page); outline it with add_measurements, or give gap", k + 1)),
+		}
+	}
+	let cat = match (&a.category, shapes.is_empty()) {
+		(Some(c), false) => Some(resolve_category(ctx, c, if shapes.iter().all(|s| s.1) { CategoryKind::Length } else { CategoryKind::Area }, true, None)?),
+		_ => None,
+	};
+	let mut ids = Vec::new();
+	{
+		let mut doc = ctx.doc.lock();
+		let mut new = Vec::new();
+		let mut hows = Vec::new();
+		for (k, perimeter, pts, it, how) in shapes {
+			let n = pts.len();
+			let mut m = Measurement::new(new_id("ms"), v.page, if perimeter { MeasurementType::Length } else { MeasurementType::Area }, pts);
+			m.closed = perimeter;
+			m.category_id = cat.clone();
+			m.label = it.label.clone();
+			m.note = it.note.clone();
+			m.depth = it.depth;
+			m.source = Some(Source::Ai);
+			m.meta = ai_meta();
+			ids.push(m.id.clone());
+			hows.push((k, n, how));
+			new.push(m);
+		}
+		if !new.is_empty() {
+			doc.edit(&format!("AI: fill {} area(s)", new.len()), |d| d.measurements.extend(new));
+		}
+		for (id, (k, n, how)) in ids.iter().zip(hows) {
+			if let Some(m) = doc.data.measurements.iter().find(|m| &m.id == id) {
+				let value = match (m.value, &m.unit) {
+					(Some(val), Some(u)) => format!("{val:.2} {u}"),
+					_ => format!("no value (page {} has no scale yet)", v.page),
+				};
+				lines.push(format!("item {}: {id} = {value} ({n} vertices{how})", k + 1));
+			}
+		}
+	}
+	lines.sort();
+	if !ids.is_empty() {
+		changed(ctx);
+	}
+	let mut out = ToolOutput::text(format!("Filled {} of {} space(s). Check the render: a fill that leaked through an opening shows far bigger than the space; delete it and give gap, or outline it.\n{}", ids.len(), a.items.len(), lines.join("\n")));
+	if let Some(img) = evidence(ctx, v.page, &ids, "fill_area") {
+		out.images.push(img);
+	}
+	Ok(out)
+}
+
 // ── update / delete ───────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -555,9 +692,11 @@ pub fn delete_items(ctx: &mut ToolCtx, a: DeleteArgs) -> Result<ToolOutput, Stri
 	let set: HashSet<String> = a.ids.iter().cloned().collect();
 	let (removed, missing, locked) = {
 		let mut doc = ctx.doc.lock();
-		let missing: Vec<String> = a.ids.iter().filter(|id| doc.data.find(id).is_none()).cloned().collect();
+		// Once each: a model that names a missing id twice must not count it twice.
+		let mut seen = HashSet::new();
+		let missing: Vec<String> = a.ids.iter().filter(|id| doc.data.find(id).is_none() && seen.insert(id.as_str())).cloned().collect();
 		let n = doc.edit(&format!("AI: delete {} item(s)", set.len()), |d| d.delete_ids(&set));
-		let locked = set.len() - missing.len() - n;
+		let locked = set.len().saturating_sub(missing.len() + n);
 		(n, missing, locked)
 	};
 	changed(ctx);
@@ -670,14 +809,26 @@ pub fn update_category(ctx: &mut ToolCtx, a: UpdateCategoryArgs) -> Result<ToolO
 #[derive(Deserialize)]
 pub struct SummaryArgs {
 	pub page: Option<u32>,
+	/// Space id or name: only what is in it (or in spaces inside it).
+	pub space: Option<String>,
 }
 
 pub fn summary(ctx: &mut ToolCtx, a: SummaryArgs) -> Result<ToolOutput, String> {
 	let doc = ctx.doc.lock();
 	let d = &doc.data;
 	let mut out = String::new();
-	let lines = takeoff_core::list::summary(&doc);
-	out.push_str("Takeoff summary (whole drawing):\n");
+	let spaces = takeoff_core::spaces::Spaces::new(d);
+	let of = spaces.attribute(d);
+	let within = a.space.as_deref().map(|k| resolve_space(d, k)).transpose()?;
+	let keep = |id: &str| within.as_deref().is_none_or(|w| spaces.is_within(of.get(id).map(String::as_str), w));
+	let lines: Vec<takeoff_core::list::SummaryLine> = match &within {
+		Some(_) => takeoff_core::list::summary_where(&doc, |id, _| keep(id)).into_iter().filter(|l| l.items > 0).collect(),
+		None => takeoff_core::list::summary(&doc),
+	};
+	match &within {
+		Some(w) => out.push_str(&format!("Takeoff summary (in {}):\n", spaces.path_name(w))),
+		None => out.push_str("Takeoff summary (whole drawing):\n"),
+	}
 	if lines.is_empty() {
 		out.push_str("  nothing taken off yet\n");
 	}
@@ -693,8 +844,16 @@ pub fn summary(ctx: &mut ToolCtx, a: SummaryArgs) -> Result<ToolOutput, String> 
 			l.warning.as_ref().map(|w| format!(" — {w}")).unwrap_or_default()
 		));
 	}
+	// Per space, when there are spaces and no space was asked for.
+	if within.is_none() && !spaces.is_empty() {
+		out.push_str("By space (each quantity once, in the deepest space it is in):\n");
+		for g in takeoff_core::list::summary_by_space(&doc) {
+			let items: Vec<String> = g.lines.iter().map(|l| format!("{} {}", l.name, l.total_text)).collect();
+			out.push_str(&format!("  {}{}: {}\n", g.name, g.page.map(|p| format!(" (p{p})")).unwrap_or_default(), items.join(", ")));
+		}
+	}
 	// Per page × category.
-	let mut pages: Vec<u32> = d.marks.iter().map(|m| m.page).chain(d.measurements.iter().map(|m| m.page)).collect();
+	let mut pages: Vec<u32> = d.marks.iter().filter(|m| keep(&m.id)).map(|m| m.page).chain(d.measurements.iter().filter(|m| keep(&m.id)).map(|m| m.page)).collect();
 	pages.sort_unstable();
 	pages.dedup();
 	if let Some(p) = a.page {
@@ -703,8 +862,8 @@ pub fn summary(ctx: &mut ToolCtx, a: SummaryArgs) -> Result<ToolOutput, String> 
 	for p in &pages {
 		out.push_str(&format!("Page {p}{}:\n", if d.scale_for(*p).is_none() { " (NO SCALE — measurements have no values)" } else { "" }));
 		for c in d.categories.iter().map(|c| Some(c.id.clone())).chain(std::iter::once(None)) {
-			let marks: Vec<&Mark> = d.marks.iter().filter(|m| m.page == *p && m.category_id == c).collect();
-			let meas: Vec<&Measurement> = d.measurements.iter().filter(|m| m.page == *p && m.category_id == c).collect();
+			let marks: Vec<&Mark> = d.marks.iter().filter(|m| m.page == *p && m.category_id == c && keep(&m.id)).collect();
+			let meas: Vec<&Measurement> = d.measurements.iter().filter(|m| m.page == *p && m.category_id == c && keep(&m.id)).collect();
 			if marks.is_empty() && meas.is_empty() {
 				continue;
 			}

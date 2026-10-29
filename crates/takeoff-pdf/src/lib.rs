@@ -6,13 +6,17 @@
 //! without rasterizing the rest of the sheet.
 
 pub mod burn;
+pub mod compare;
 pub mod cos;
 pub mod export;
+pub mod fill;
 pub mod layers;
 pub mod ops;
 pub mod outline;
 pub mod overlay;
 pub mod search;
+pub mod sheets;
+pub mod slip;
 pub mod tools;
 pub mod trace;
 pub mod vectors;
@@ -236,6 +240,13 @@ impl Drawing {
 	/// Renders `region` of `page` at `dpi`. When `max_px` is set and the output
 	/// would be larger on its long edge, the DPI is lowered to fit.
 	pub fn render(&self, page: u32, dpi: f32, region: FracRect, max_px: Option<u32>) -> Result<Render, PdfError> {
+		self.render_lines(page, dpi, region, max_px, true)
+	}
+
+	/// [`Drawing::render`]; `smooth: false` draws lines without anti-aliasing,
+	/// so a hairline stays a solid pixel wide at any resolution (for reading
+	/// the line work, not for looking at).
+	pub fn render_lines(&self, page: u32, dpi: f32, region: FracRect, max_px: Option<u32>, smooth: bool) -> Result<Render, PdfError> {
 		let p = self.page(page)?;
 		let region = clamp_region(region).ok_or(PdfError::EmptyRegion)?;
 		let (pw_pt, ph_pt) = (p.width().value as f64, p.height().value as f64);
@@ -260,10 +271,11 @@ impl Drawing {
 			.render_form_data(true)
 			.render_annotations(true)
 			.clear_before_rendering(true)
+			.set_path_smoothing(smooth)
 			.set_clear_color(PdfColor::WHITE);
 		p.render_into_bitmap_with_config(&mut bitmap, &config)?;
 		let image = RgbaImage::from_raw(out_w as u32, out_h as u32, bitmap.as_rgba_bytes())
-			.expect("bitmap size matches");
+			.ok_or_else(|| PdfError::Io(format!("pdfium bitmap is not {out_w} × {out_h}")))?;
 		Ok(Render {
 			image,
 			page_px: (page_w as u32, page_h as u32),
@@ -329,5 +341,5 @@ fn clamp_region(r: FracRect) -> Option<FracRect> {
 	let y0 = r.y.clamp(0.0, 1.0);
 	let x1 = (r.x + r.w).clamp(0.0, 1.0);
 	let y1 = (r.y + r.h).clamp(0.0, 1.0);
-	(x1 > x0 && y1 > y0).then(|| FracRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+	(x1 > x0 && y1 > y0).then_some(FracRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
 }

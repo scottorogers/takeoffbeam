@@ -6,10 +6,12 @@
 | [Taking off](takeoff.md) | Scale, counts, lengths, areas, volumes, snapping, items, the Markups List |
 | [Markups](markups.md) | Text, callouts, clouds, shapes, pen, stamps |
 | [PDF tools](pdf-tools.md) | Pages, split, merge, extract, rotate, compare revisions, layers, search, export |
+| [Slip-sheets and sets](sets.md) | Replace sheets with a new revision and keep the takeoff; what changed; several drawings as one project |
 | [Graph view](graph-view.md) | The document map the AI builds: sheets, details, notes and how they relate; links on the sheet, the Map tab |
 | [The AI agent](ai.md) | What it does, how review works, local models, construction.live, custom endpoints |
 | [Command line & MCP](cli.md) | `takeoff` for scripts, and the MCP server for Claude Desktop / Cursor |
-| [File format](file-format.md) | The `.takeoff.json` sidecar |
+| [Evals](evals.md) | Scoring the agent on drawings with known answers; the vision accuracy probe per model and coordinate convention |
+| [File format](file-format.md) | The `.takeoff.json` sidecar, sheet revisions, set files |
 | [Architecture](architecture.md) | Crates, threads, rendering, the agent loop |
 | [Building & releasing](building.md) | Dev setup, tests, packaging, signing |
 | [Docker browser desktop](docker.md) | Full app on Intel Macs through noVNC, persistent drawings, CLI and MCP |

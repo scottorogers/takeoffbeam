@@ -26,6 +26,8 @@ pub enum Req {
 	Segments { page: u32 },
 	/// Follow the line drawn from near `a` to near `b` in the page's picture.
 	Trace { page: u32, a: takeoff_core::Point, b: takeoff_core::Point },
+	/// Fill the space around these points (openings to try, points of paper).
+	Fill { token: u64, page: u32, at: Vec<takeoff_core::Point>, gaps: Vec<f64> },
 	Search { query: String, match_case: bool, whole_word: bool, generation: u64, from: u32 },
 	SetHidden(HashSet<String>),
 	Reload,
@@ -49,9 +51,11 @@ pub enum Res {
 	Crop { key: String, image: egui::ColorImage },
 	Segments { page: u32, segments: Vec<Segment> },
 	Trace { page: u32, a: takeoff_core::Point, b: takeoff_core::Point, run: Option<Vec<takeoff_core::Point>> },
+	/// None: the page could not be read.
+	Fill { token: u64, fill: Option<Result<takeoff_pdf::fill::Fill, takeoff_pdf::fill::NoFill>> },
 	Search { generation: u64, hits: Vec<Hit>, done: bool },
 	LayersApplied,
-	Compare { page: u32, image: egui::ColorImage, changed: f32 },
+	Compare { page: u32, image: egui::ColorImage, changed: f32, grid: takeoff_core::slip::ChangeGrid },
 	Error(String),
 }
 
@@ -90,6 +94,15 @@ impl Worker {
 		let generation = self.view_gen.fetch_add(1, Ordering::SeqCst) + 1;
 		self.send(Req::View { page, region, px, generation });
 		generation
+	}
+
+	/// Sharp renders of several pages at once (continuous, spreads);
+	/// together they supersede any pending.
+	pub fn views(&self, views: Vec<(u32, FracRect, (u32, u32))>) {
+		let generation = self.view_gen.fetch_add(1, Ordering::SeqCst) + 1;
+		for (page, region, px) in views {
+			self.send(Req::View { page, region, px, generation });
+		}
 	}
 
 	pub fn search(&self, query: String, match_case: bool, whole_word: bool) -> u64 {
@@ -146,123 +159,124 @@ fn run(path: PathBuf, hidden: HashSet<String>, rx: Receiver<Req>, tx: Sender<Res
 				Req::SetHidden(_) | Req::Reload | Req::Compare { .. } => 0,
 				Req::View { .. } => 1,
 				Req::Base { .. } => 2,
-				Req::Segments { .. } | Req::Trace { .. } => 3,
+				Req::Segments { .. } | Req::Trace { .. } | Req::Fill { .. } => 3,
 				Req::Search { .. } => 4,
 				Req::Thumb { .. } | Req::Crop { .. } => 5,
 			})
 			.map(|(i, _)| i)
 			.unwrap();
 		let req = queue.remove(pick);
-		match req {
-			Req::SetHidden(h) => {
-				if let Err(e) = d.set_hidden_layers(&h) {
-					send(Res::Error(e.to_string()));
-				}
-				send(Res::LayersApplied);
-			}
-			Req::Reload => match open(d.hidden_layers()) {
-				Ok(nd) => {
-					d = nd;
-					send(Res::Opened(Box::new(describe(&d))));
-				}
-				Err(e) => send(Res::Error(e)),
-			},
-			Req::View { page, region, px, generation } => {
-				if generation != view_gen.load(Ordering::SeqCst) {
-					continue;
-				}
-				let Ok((w_pt, _)) = d.page_size_pt(page) else { continue };
-				// DPI that makes the region exactly px.0 wide.
-				let dpi = px.0 as f32 / (w_pt * region.w as f32) * 72.0;
-				match d.render(page, dpi, region, None) {
-					Ok(r) => send(Res::View { page, region: r.region, generation, image: to_color_image(r.image) }),
-					Err(e) => send(Res::Error(e.to_string())),
-				}
-			}
-			Req::Compare { page, other, other_page, max_px } => match compare(&d, page, &other, other_page, max_px) {
-				Ok((image, changed)) => send(Res::Compare { page, image, changed }),
-				Err(e) => send(Res::Error(e)),
-			},
-			Req::Base { page, max_px } => {
-				if let Ok(r) = d.render(page, 300.0, FracRect::FULL, Some(max_px)) {
-					send(Res::Base { page, image: to_color_image(r.image) });
-				}
-			}
-			Req::Thumb { page, max_px } => {
-				if let Ok(r) = d.render(page, 30.0, FracRect::FULL, Some(max_px)) {
-					send(Res::Thumb { page, image: to_color_image(r.image) });
-				}
-			}
-			Req::Crop { key, page, region, max_px } => {
-				if let Ok(r) = d.render(page, 150.0, region, Some(max_px)) {
-					send(Res::Crop { key, image: to_color_image(r.image) });
-				}
-			}
-			Req::Segments { page } => {
-				let segments = d.segments(page).unwrap_or_default();
-				send(Res::Segments { page, segments });
-			}
-			Req::Trace { page, a, b } => {
-				let run = d.track_raster(page, a, b).ok().flatten();
-				send(Res::Trace { page, a, b, run });
-			}
-			Req::Search { query, match_case, whole_word, generation, from } => {
-				let n = d.page_count();
-				let mut batch = Vec::new();
-				if from > n {
-					send(Res::Search { generation, hits: vec![], done: true });
-				}
-				for p in from..=n {
-					if generation != search_gen.load(Ordering::SeqCst) {
-						break;
+		// What the UI waits on, should the request panic (a pdfium or geometry bug on an odd file):
+		// the worker reports it and carries on, so one bad page doesn't stop all rendering.
+		let fallback = match &req {
+			Req::Segments { page } => Some(Res::Segments { page: *page, segments: vec![] }),
+			Req::Trace { page, a, b } => Some(Res::Trace { page: *page, a: *a, b: *b, run: None }),
+			Req::Fill { token, .. } => Some(Res::Fill { token: *token, fill: None }),
+			Req::Search { generation, .. } => Some(Res::Search { generation: *generation, hits: vec![], done: true }),
+			Req::SetHidden(_) => Some(Res::LayersApplied),
+			_ => None,
+		};
+		let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			match req {
+				Req::SetHidden(h) => {
+					if let Err(e) = d.set_hidden_layers(&h) {
+						send(Res::Error(e.to_string()));
 					}
-					batch.extend(d.search_page(p, &query, match_case, whole_word, 200).unwrap_or_default());
-					if batch.len() >= 40 || p == n {
-						send(Res::Search { generation, hits: std::mem::take(&mut batch), done: p == n });
+					send(Res::LayersApplied);
+				}
+				Req::Reload => match open(d.hidden_layers()) {
+					Ok(nd) => {
+						d = nd;
+						send(Res::Opened(Box::new(describe(&d))));
 					}
-					if !rx.is_empty() {
-						// Let views/thumbs through between pages; resume the search after.
-						queue.extend(rx.try_iter());
-						if queue.iter().any(|r| matches!(r, Req::View { .. } | Req::Base { .. } | Req::SetHidden(_))) {
-							if !batch.is_empty() {
-								send(Res::Search { generation, hits: std::mem::take(&mut batch), done: false });
-							}
-							queue.push(Req::Search { query: query.clone(), match_case, whole_word, generation, from: p + 1 });
+					Err(e) => send(Res::Error(e)),
+				},
+				Req::View { page, region, px, generation } => {
+					if generation != view_gen.load(Ordering::SeqCst) {
+						return;
+					}
+					let Ok((w_pt, _)) = d.page_size_pt(page) else { return };
+					// DPI that makes the region exactly px.0 wide.
+					let dpi = px.0 as f32 / (w_pt * region.w as f32) * 72.0;
+					match d.render(page, dpi, region, None) {
+						Ok(r) => send(Res::View { page, region: r.region, generation, image: to_color_image(r.image) }),
+						Err(e) => send(Res::Error(e.to_string())),
+					}
+				}
+				Req::Compare { page, other, other_page, max_px } => match compare(&d, page, &other, other_page, max_px) {
+					Ok((image, changed, grid)) => send(Res::Compare { page, image, changed, grid }),
+					Err(e) => send(Res::Error(e)),
+				},
+				Req::Base { page, max_px } => {
+					if let Ok(r) = d.render(page, 300.0, FracRect::FULL, Some(max_px)) {
+						send(Res::Base { page, image: to_color_image(r.image) });
+					}
+				}
+				Req::Thumb { page, max_px } => {
+					if let Ok(r) = d.render(page, 30.0, FracRect::FULL, Some(max_px)) {
+						send(Res::Thumb { page, image: to_color_image(r.image) });
+					}
+				}
+				Req::Crop { key, page, region, max_px } => {
+					if let Ok(r) = d.render(page, 150.0, region, Some(max_px)) {
+						send(Res::Crop { key, image: to_color_image(r.image) });
+					}
+				}
+				Req::Segments { page } => {
+					let segments = d.segments(page).unwrap_or_default();
+					send(Res::Segments { page, segments });
+				}
+				Req::Trace { page, a, b } => {
+					let run = d.track_raster(page, a, b).ok().flatten();
+					send(Res::Trace { page, a, b, run });
+				}
+				Req::Fill { token, page, at, gaps } => {
+					let fill = d.fill_area(page, &at, &gaps).ok();
+					send(Res::Fill { token, fill });
+				}
+				Req::Search { query, match_case, whole_word, generation, from } => {
+					let n = d.page_count();
+					let mut batch = Vec::new();
+					if from > n {
+						send(Res::Search { generation, hits: vec![], done: true });
+					}
+					for p in from..=n {
+						if generation != search_gen.load(Ordering::SeqCst) {
 							break;
+						}
+						batch.extend(d.search_page(p, &query, match_case, whole_word, 200).unwrap_or_default());
+						if batch.len() >= 40 || p == n {
+							send(Res::Search { generation, hits: std::mem::take(&mut batch), done: p == n });
+						}
+						if !rx.is_empty() {
+							// Let views/thumbs through between pages; resume the search after.
+							queue.extend(rx.try_iter());
+							if queue.iter().any(|r| matches!(r, Req::View { .. } | Req::Base { .. } | Req::SetHidden(_))) {
+								if !batch.is_empty() {
+									send(Res::Search { generation, hits: std::mem::take(&mut batch), done: false });
+								}
+								queue.push(Req::Search { query: query.clone(), match_case, whole_word, generation, from: p + 1 });
+								break;
+							}
 						}
 					}
 				}
+			}
+		}));
+		if let Err(why) = handled {
+			let why = why.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| why.downcast_ref::<String>().cloned()).unwrap_or_default();
+			send(Res::Error(format!("The drawing could not be read there (internal error: {why})")));
+			if let Some(r) = fallback {
+				send(r);
 			}
 		}
 	}
 }
 
-/// Revision overlay: this page in red, the other in blue, shared ink black.
-/// Both are rendered to the same pixel size so the sheets line up when they
-/// share a paper size (the normal case for revisions).
-fn compare(d: &Drawing, page: u32, other: &std::path::Path, other_page: u32, max_px: u32) -> Result<(egui::ColorImage, f32), String> {
-	let a = d.render(page, 300.0, FracRect::FULL, Some(max_px)).map_err(|e| e.to_string())?;
+/// Revision overlay: this page in red, the other in blue, shared ink black,
+/// and where the sheet changed (see `takeoff_pdf::compare`).
+fn compare(d: &Drawing, page: u32, other: &std::path::Path, other_page: u32, max_px: u32) -> Result<(egui::ColorImage, f32, takeoff_core::slip::ChangeGrid), String> {
 	let o = Drawing::open(other).map_err(|e| format!("Could not open the other drawing: {e}"))?;
-	let (ow, _) = o.page_size_pt(other_page).map_err(|e| e.to_string())?;
-	let dpi = a.image.width() as f32 / ow * 72.0;
-	let b = o.render(other_page, dpi, FracRect::FULL, None).map_err(|e| e.to_string())?;
-	let b = if b.image.dimensions() == a.image.dimensions() {
-		b.image
-	} else {
-		image::imageops::resize(&b.image, a.image.width(), a.image.height(), image::imageops::FilterType::Triangle)
-	};
-	let (w, h) = a.image.dimensions();
-	let mut out = Vec::with_capacity((w * h * 4) as usize);
-	let mut changed = 0u64;
-	let lum = |p: &image::Rgba<u8>| (p[0] as u32 * 3 + p[1] as u32 * 6 + p[2] as u32) / 10;
-	for (pa, pb) in a.image.pixels().zip(b.pixels()) {
-		let (la, lb) = (lum(pa).min(255) as u8, lum(pb).min(255) as u8);
-		if la.abs_diff(lb) > 60 {
-			changed += 1;
-		}
-		// Only-this = red, only-other = blue, both = dark, neither = white.
-		out.extend_from_slice(&[lb, la.min(lb), la, 255]);
-	}
-	let frac = changed as f32 / (w as f32 * h as f32);
-	Ok((egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &out), frac))
+	let diff = takeoff_pdf::compare::compare_pages(d, page, &o, other_page, max_px).map_err(|e| e.to_string())?;
+	Ok((to_color_image(diff.image), diff.changed, diff.grid))
 }

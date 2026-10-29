@@ -49,7 +49,7 @@ pub fn parse_color(hex: &str) -> (u8, u8, u8) {
 	let h = hex.trim_start_matches('#');
 	let v = |i: usize| u8::from_str_radix(h.get(i..i + 2).unwrap_or("ff"), 16).unwrap_or(255);
 	if h.len() == 3 {
-		let c = |i: usize| u8::from_str_radix(&h[i..i + 1].repeat(2), 16).unwrap_or(255);
+		let c = |i: usize| u8::from_str_radix(&h.get(i..i + 1).unwrap_or("f").repeat(2), 16).unwrap_or(255);
 		return (c(0), c(1), c(2));
 	}
 	(v(0), v(2), v(4))
@@ -118,7 +118,10 @@ impl Canvas {
 		let (bw, bh) = (w + 2.0 * pad_x, f.ascent() - f.descent() + 2.0 * pad_y);
 		let r = bh / 2.0;
 		let mut pb = PathBuilder::new();
-		pb.push_rect(tiny_skia::Rect::from_xywh(x + r.min(bw / 2.0), y, (bw - 2.0 * r).max(0.1), bh).unwrap());
+		// None off at infinity (a point far off the page in a hand-edited file).
+		if let Some(rect) = tiny_skia::Rect::from_xywh(x + r.min(bw / 2.0), y, (bw - 2.0 * r).max(0.1), bh) {
+			pb.push_rect(rect);
+		}
 		pb.push_circle(x + r, y + r, r);
 		pb.push_circle(x + bw - r, y + r, r);
 		if let Some(p) = pb.finish() {
@@ -330,6 +333,12 @@ pub fn burn(img: &mut RgbaImage, region: FracRect, page_size_pt: (f64, f64), dat
 		}
 	}
 
+	if opts.annotations {
+		for l in data.legends.iter().filter(|l| l.page == page) {
+			draw_legend(&mut c, l, data);
+		}
+	}
+
 	if opts.scales {
 		for s in data.page_scales.iter().filter(|s| s.page == page) {
 			if s.p1 == (Point { x: 0.0, y: 0.0 }) && s.p2.y == 0.0 {
@@ -484,7 +493,7 @@ fn cloud_path(c: &Canvas, pts: &[Point]) -> Option<tiny_skia::Path> {
 		let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
 		let (dx, dy) = (b.0 - a.0, b.1 - a.1);
 		let len = (dx * dx + dy * dy).sqrt();
-		let n = (len / arc).ceil().max(1.0) as usize;
+		let n = (len / arc).ceil().clamp(1.0, 10_000.0) as usize;
 		let (nx, ny) = (-dy / len * sign, dx / len * sign);
 		for k in 0..n {
 			let t0 = k as f32 / n as f32;
@@ -514,6 +523,67 @@ fn wrap(text: &str, size: f32, max_w: f32) -> Vec<String> {
 		lines.push(line);
 	}
 	lines
+}
+
+/// A legend box: frame, title, header, and a swatch, name and totals per row.
+fn draw_legend(c: &mut Canvas, l: &Legend, data: &TakeoffData) {
+	use takeoff_core::legend::{hatch_lines, layout, rows_for, Swatch};
+	// The page's shape as rendered (height / width).
+	let aspect = (c.pix.height() as f64 / c.region.h) / (c.pix.width() as f64 / c.region.w);
+	let rows = rows_for(data, l);
+	let lay = layout(l, &rows, aspect);
+	let u = c.unit();
+	let ink = (40, 40, 40);
+	let (x0, y0) = c.to_px(Point { x: l.x, y: l.y });
+	let (x1, y1) = c.to_px(Point { x: l.x + l.w, y: l.y + l.h });
+	let Some(frame) = c.rect_path(x0, y0, x1, y1) else { return };
+	c.fill(&frame, (255, 255, 255), 0.94);
+	c.stroke(&frame, ink, 0.9, u, None);
+	for (a, b) in &lay.rules {
+		if let Some(p) = c.path(&[*a, *b], false) {
+			c.stroke(&p, (150, 150, 150), 0.9, u * 0.6, None);
+		}
+	}
+	for ((x, y, w, h), k) in &lay.swatches {
+		let row = &rows[*k];
+		let rgb = parse_color(&row.color);
+		let (sx0, sy0) = c.to_px(Point { x: *x, y: *y });
+		let (sx1, sy1) = c.to_px(Point { x: x + w, y: y + h });
+		let Some(r) = c.rect_path(sx0, sy0, sx1, sy1) else { continue };
+		match row.swatch {
+			Swatch::Count => {
+				c.fill(&r, rgb, 0.18 * row.opacity as f32);
+				c.stroke(&r, rgb, 1.0, 1.5 * u, None);
+			}
+			Swatch::Length(style) => {
+				let mid = y + h / 2.0;
+				if let Some(p) = c.path(&[Point { x: *x, y: mid }, Point { x: x + w, y: mid }], false) {
+					c.stroke(&p, rgb, 1.0, 2.0 * u, dash_for(style));
+				}
+			}
+			Swatch::Area(hk) => {
+				c.fill(&r, rgb, 0.25 * row.opacity as f32);
+				for (a, b) in hk.map(|hk| hatch_lines((*x, *y, *w, *h), hk, aspect, 6)).unwrap_or_default() {
+					if let Some(p) = c.path(&[a, b], false) {
+						c.stroke(&p, rgb, 0.7, 0.8 * u, None);
+					}
+				}
+				c.stroke(&r, rgb, 1.0, 1.2 * u, None);
+			}
+			Swatch::Markup(_) => c.stroke(&r, rgb, row.opacity as f32, 1.5 * u, None),
+		}
+	}
+	for t in &lay.texts {
+		let size = (t.size / c.region.h * c.pix.height() as f64) as f32;
+		if size < 2.0 {
+			continue;
+		}
+		let (mut x, y) = c.to_px(t.at);
+		if t.right {
+			x -= Canvas::text_width(size, &t.text);
+		}
+		c.text(x, y + size * 0.8, size, &t.text, if t.muted { (110, 110, 110) } else { ink });
+	}
 }
 
 /// Draw arbitrary segments (snap geometry debug / agent "show lines").
@@ -582,4 +652,18 @@ pub fn burn_label(img: &mut RgbaImage, x: f32, y: f32, size: f32, text: &str, fg
 	c.pix.data_mut().copy_from_slice(img.as_raw());
 	c.label(x, y, size, text, fg, bg);
 	img.copy_from_slice(c.pix.data());
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn odd_colours_and_far_off_labels_dont_panic() {
+		assert_eq!(parse_color("#é1"), (255, 255, 17));
+		assert_eq!(parse_color("#f80"), (255, 136, 0));
+		let mut img = RgbaImage::new(64, 64);
+		burn_label(&mut img, f32::INFINITY, 0.0, 12.0, "7", (255, 255, 255), (0, 0, 0));
+		burn_label(&mut img, f32::NAN, f32::NAN, 12.0, "7", (255, 255, 255), (0, 0, 0));
+	}
 }

@@ -3,6 +3,7 @@
 
 pub const MOUSE_POINTER_2: &str = "\u{e1c2}";
 pub const ROUTE: &str = "\u{e542}";
+pub const PAINT_BUCKET: &str = "\u{e2e5}";
 pub const HAND: &str = "\u{e1d6}";
 pub const ZOOM_IN: &str = "\u{e1b5}";
 pub const ZOOM_OUT: &str = "\u{e1b6}";
@@ -114,3 +115,7 @@ pub const SQUARE_DOT: &str = "\u{e171}";
 pub const LASSO: &str = "\u{e1cd}";
 pub const KEYBOARD: &str = "\u{e283}";
 pub const HISTORY: &str = "\u{e1f4}";
+pub const FILE: &str = "\u{e0c4}";
+pub const GALLERY_VERTICAL: &str = "\u{e4d5}";
+pub const BOOK_OPEN: &str = "\u{e063}";
+pub const LAYOUT_GRID: &str = "\u{e104}";

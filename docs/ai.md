@@ -99,17 +99,18 @@ reads positions off a numbered **view** (`v3`) and the tools convert them.
 | `map_sheets` / `map_add` / `map_remove` | Build the map: the sheet index, areas (boxed off a view) and links with a note on how they relate |
 | `delegate` | Hand parts of a long job to subagents that run in parallel (the app's own agent; Claude Code uses its own `Agent` tool) |
 | `view` | Render a page or region with markups and badges; registers a view id |
-| `read_items` / `find_items_at` | List items; find which item is at a spot in a view |
+| `read_items` / `find_items_at` | List items (with the space each is in, or only one space's); find which item is at a spot in a view |
 | `add_marks` / `add_measurements` | Count marks; lengths, areas, angles (optionally snapped to lines). `path: follow` runs a length along the drawing's own line between the points (curves, dashes, crossings); `path: smooth` curves through them |
 | `update_items` / `delete_items` | Edit or remove items |
 | `create_category` / `update_category` | Takeoff items |
-| `summary` | Counts and totals per page and item |
+| `summary` | Counts and totals per item, per space and per page |
 | `add_annotation` | Clouds, callouts, text, arrows… |
 | `set_scale` / `set_scale_preset` / `check_scale` / `calibrate` | Scale from a dimension, a printed scale, or automatically; measure-back check |
 | `detect` | Tiled symbol sweep, optionally against a legend crop |
 | `trace` | Trace polylines/polygons with vision |
 | `read_text` / `search_text` | The PDF's own text with positions |
 | `set_hidden_layers` | Layer visibility (shared with you) |
+| `fill_area` | Measure a space by a point inside it: the outline the drawn lines make around it, doorways closed (vector and scanned sheets). Several points fill together as one area |
 | `follow_line` | Measure a whole connected run from one point |
 | `set_viewport` | Show where it's looking |
 | `switch_drawing` | Move its tools to another open drawing (tab) |
@@ -155,6 +156,11 @@ These are measurements from Qwen3.8 27B (Q4_K_M) on an M3 Max with 36 GB.
   it on in *Models* for hard sheets.
 - **Not yet verified with a live local model:** full symbol sweeps (`detect`), `trace` and
   `follow_line`. They are covered by tests with a scripted model.
+
+To measure a model yourself, use `takeoff eval probe` (how accurately it places boxes, in each
+convention) and `takeoff eval run` (whole jobs on sheets with known answers). On the synthetic
+sheets, Qwen3.8 27B put 18 of 18 boxes on target in its own convention; Gemma 3 4B put none. See
+[Evals](evals.md).
 
 ## Your own Claude Code or Codex, or OpenCode's free models
 

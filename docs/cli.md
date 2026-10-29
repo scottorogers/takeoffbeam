@@ -16,17 +16,23 @@ takeoff merge a.pdf b.pdf c.pdf -o set.pdf
 takeoff extract plans.pdf --pages "3,1-2" -o subset.pdf
 takeoff rotate plans.pdf --pages 4-6 --turns 1           # in place, keeps "(original).pdf"
 takeoff delete plans.pdf --pages 7
+takeoff slip-sheet plans.pdf "plans rev C.pdf" --dry-run   # match by sheet number; drop --dry-run to swap
 
 takeoff export plans.pdf --pdf-out marked.pdf --csv markups.csv --summary quantities.csv
+takeoff export plans.pdf --xlsx takeoff.xlsx             # markups + summary sheets
 
 takeoff models list                                      # installed models + memory fit
 takeoff models catalog --context 65536
 
 takeoff agent plans.pdf --page 3 --model local:Qwen3.8-27B-Q4_K_M "count the duplex receptacles"
 takeoff agent plans.pdf --base-url http://localhost:1234/v1 --model qwen3-vl-30b "set the scale"
+
+takeoff eval run --base-url http://localhost:1234/v1 --model qwen3-vl-30b     # score the agent on evals/cases
+takeoff eval probe --base-url http://localhost:1234/v1 --model qwen3-vl-30b   # box accuracy per coordinate convention
 ```
 
-Page tools carry the takeoff along, exactly as in the app.
+Page tools carry the takeoff along, exactly as in the app. `takeoff eval` is described in
+[Evals](evals.md).
 
 ## MCP
 
@@ -52,6 +58,22 @@ client model. Set `TAKEOFF_MCP_MODEL=gemini` (or `qwen3`) when the client model 
 coordinate convention.
 
 Open the same PDF in Takeoff Desk to see and confirm what the agent marked.
+
+## Claude Code
+
+The repo is a Claude Code plugin marketplace, so the same tools are two commands away in a
+terminal:
+
+```
+/plugin marketplace add constructionlive/takeoffbeam
+/plugin install takeoff-beam@takeoffbeam
+```
+
+Then `/takeoff-beam:takeoff ~/Plans/E-201.pdf count the duplex receptacles on page 2`, or just
+mention a drawing: the plugin's `takeoff` skill knows to set and check the scale first, zoom
+before marking, sweep in tiles and report from `summary`. The plugin starts `takeoff mcp`
+through `claude-plugin/scripts/takeoff-mcp.js`, which finds the binary inside the installed app
+(or on `PATH`, or at `TAKEOFF_BIN`). See [claude-plugin/README.md](../claude-plugin/README.md).
 
 ## Serving pages to an app
 

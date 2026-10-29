@@ -48,10 +48,24 @@ render time.
     "svg": "<svg …>…</svg>",           // or "image": "/abs/path/zones.png"
     "opacity": 0.6, "label": "Pour zones", "hidden": false, "source": "ai"
   }],
+  "spaces": [{                               // named regions quantities belong to
+    "id": "sp_…", "page": 1, "name": "Unit 204", "color": "#34D399",
+    "points": [{ "x": 0.1, "y": 0.1 }, …],    // polygon, implicitly closed
+    "hidden": false, "author": "Ana", "createdAt": 1791993600000
+  }],
+  "legends": [{                              // a legend box on the sheet
+    "id": "lg_…", "page": 1, "x": 0.68, "y": 0.72, "w": 0.28, "h": 0.2,
+    "title": "Electrical",                   // unset = "Legend"
+    "scope": "page",                         // page | document
+    "categoryIds": ["c_…"],                  // only these items; empty = all in scope
+    "columns": { "count": true, "quantity": true, "cost": false },
+    "markups": false                         // also list markups by subject
+  }],
   "customFields": [{ "id": "f_…", "name": "Phase" }],
   "hiddenLayers": ["E-LIGHTING"],
   "layers": [{ "name": "E-LIGHTING", "description": "lighting fixtures and circuits" }],
-  "display": { "lengthFormat": "feetInches", "precision": 2, "fractionDenominator": 16 }
+  "display": { "lengthFormat": "feetInches", "precision": 2, "fractionDenominator": 16 },
+  "sheetRevisions": [{ "page": 2, "sheet": "A-102", "file": "plan.pdf.revisions/plan 2026-10-27 1403.pdf", … }]
 }
 ```
 
@@ -64,6 +78,62 @@ render time.
   scales, layers and custom fields.
 - **Badge numbers** are reading order per item: page → rows top to bottom → left to right. They
   are recomputed, never stored.
+- **Spaces** store only their outline. Which space an item is in is worked out from geometry on
+  every change, never stored on the item (see [Spaces](takeoff.md#spaces)), so moving a mark
+  or reshaping a space updates the Space column by itself. Spaces nest by geometry; there is no
+  parent field.
+- **Legends** store only their box and options. Their rows (items, counts, totals) are computed
+  from the takeoff whenever they are drawn.
+- **Adding fields without breaking anyone:** `spaces` and `legends` are left out of the file
+  when empty, so a takeoff without them is byte-for-byte the shape it was before. Every reader
+  ignores keys it doesn't know: older Takeoff Desk versions and construction.live open files
+  with spaces and legends (and drop them if they save), and this version ignores keys added by
+  newer ones. A legend `scope` this version doesn't know is read as `page`; missing `columns`
+  entries take their defaults.
+
+## Sheet revisions
+
+A [slip-sheet](sets.md) keeps the pages it replaced in a history PDF next to the drawing:
+`plan.pdf` → `plan.pdf.revisions/plan 2026-10-27 1403.pdf`, with its own `.takeoff.json` (the
+takeoff of those pages as it was). The drawing's sidecar lists them, oldest first:
+
+```jsonc
+"sheetRevisions": [{
+  "page": 2,                          // the page it is an earlier revision of, as the drawing is now
+  "sheet": "A-102",                   // the new page's sheet number
+  "file": "plan.pdf.revisions/plan 2026-10-27 1403.pdf",   // relative to the drawing's folder
+  "filePage": 2,                      // its page in that file
+  "replacedAt": "2026-10-27T14:03:12Z",
+  "from": "plan rev C.pdf", "fromPage": 5,                 // where the new page came from
+  "slip": "sl_…",                     // one id per slip-sheet
+  "changed": 0.012,                   // share of the sheet that changed
+  "review": ["m_…", "ms_…"],          // items on changed parts of the sheet: check them
+  "warning": "Page size changed (36.0×24.0 in → 42.0×24.0 in): …"
+}]
+```
+
+The field is optional: files without it load as before, and readers that don't know it (the
+platform, older Takeoff Desk) ignore it. Page tools renumber it with the pages.
+
+## Set files
+
+A [set](sets.md) is a separate file, `Tower.takeoffset.json`, that lists drawings in order. Each
+drawing keeps its own `.takeoff.json`; the set holds no takeoff.
+
+```jsonc
+{
+  "version": 1,
+  "name": "Tower",
+  "documents": [
+    { "path": "Tower - Architectural.pdf", "name": "Architectural" },   // relative to the set file
+    { "path": "Structural/S-set.pdf" },                                 // name: the file name
+    { "path": "/Volumes/Projects/Tower/MEP.pdf" }                       // or absolute
+  ],
+  "lastUpdated": "2026-10-27T14:03:12Z"
+}
+```
+
+Unknown fields are ignored on load.
 
 ## Document map
 

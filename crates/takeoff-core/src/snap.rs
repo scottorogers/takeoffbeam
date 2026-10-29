@@ -52,7 +52,7 @@ impl SnapIndex {
 			let (cx0, cx1) = ((x0 / cell).floor() as i32, (x1 / cell).floor() as i32);
 			let (cy0, cy1) = ((y0 / cell).floor() as i32, (y1 / cell).floor() as i32);
 			// Very long segments (borders): cap cells to keep the index small.
-			if (cx1 - cx0 + 1) as i64 * (cy1 - cy0 + 1) as i64 > 4096 {
+			if (cx1 as i64 - cx0 as i64 + 1) * (cy1 as i64 - cy0 as i64 + 1) > 4096 {
 				continue;
 			}
 			for cx in cx0..=cx1 {
@@ -69,12 +69,13 @@ impl SnapIndex {
 	}
 
 	fn near(&self, p: Point, tol_frac: f64) -> Vec<usize> {
-		let r = (tol_frac / self.cell).ceil() as i32;
+		// The page is 64 cells across: a wider reach (a page with no size) finds nothing more.
+		let r = (tol_frac / self.cell).ceil().min(80.0) as i32;
 		let (cx, cy) = ((p.x / self.cell).floor() as i32, (p.y / self.cell).floor() as i32);
 		let mut out: Vec<usize> = Vec::new();
 		for dx in -r..=r {
 			for dy in -r..=r {
-				if let Some(v) = self.grid.get(&(cx + dx, cy + dy)) {
+				if let Some(v) = self.grid.get(&(cx.saturating_add(dx), cy.saturating_add(dy))) {
 					out.extend_from_slice(v);
 				}
 			}
@@ -333,7 +334,7 @@ fn intersect(s: &Segment, t: &Segment) -> Option<Point> {
 	}
 	let u = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den;
 	let v = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / den;
-	((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then(|| Point { x: x1 + u * (x2 - x1), y: y1 + u * (y2 - y1) })
+	((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then_some(Point { x: x1 + u * (x2 - x1), y: y1 + u * (y2 - y1) })
 }
 
 /// Fit a rough polyline onto the drawing: each vertex snaps to the nearest
@@ -449,5 +450,18 @@ mod tests {
 		assert!(run.len() < 200, "simplified: {} points", run.len());
 		// Nothing leads from the curve to a point off every line.
 		assert!(g.track(from, p(0.1, 0.1)).is_none());
+	}
+
+	#[test]
+	fn far_off_lines_and_sizeless_pages_dont_overflow() {
+		// A broken file: a line out at 1e30 and one across the whole i32 range, on a page with no size.
+		let segs = vec![Segment { a: p(1e30, 1e30), b: p(1e30, -1e30) }, Segment { a: p(-1e30, 0.5), b: p(1e30, 0.5) }, Segment { a: p(0.2, 0.2), b: p(0.4, 0.2) }];
+		for (w, h) in [(0.0, 0.0), (1000.0, 1000.0)] {
+			let g = SnapIndex::new(segs.clone(), w, h);
+			let _ = g.nearest(p(0.3, 0.2), 8.0);
+			let _ = g.nearest(p(1e30, 1e30), 8.0);
+			let _ = g.track(p(0.2, 0.2), p(0.4, 0.2));
+			let _ = g.follow(2, 2.0);
+		}
 	}
 }

@@ -13,13 +13,18 @@ pub mod coords;
 pub mod docmap;
 pub mod doc;
 pub mod geometry;
+pub mod legend;
 pub mod list;
 pub mod model;
 pub mod normalize;
 pub mod numbering;
 pub mod pages;
+pub mod set;
+pub mod sheets;
 pub mod sidecar;
+pub mod slip;
 pub mod snap;
+pub mod spaces;
 pub mod time;
 pub mod units;
 

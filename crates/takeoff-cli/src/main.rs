@@ -10,6 +10,7 @@ use takeoff_core::sidecar;
 use takeoff_pdf::tools::SplitMode;
 use takeoff_pdf::{Drawing, FracRect};
 
+mod evals;
 mod mcp;
 mod serve;
 
@@ -105,7 +106,20 @@ enum Cmd {
 		#[arg(long, default_value_t = 1)]
 		turns: u32,
 	},
-	/// Export the takeoff: flattened PDF, markups CSV, quantity summary CSV.
+	/// Replace sheets with a newer revision, matched by sheet number (the takeoff stays on them).
+	SlipSheet {
+		pdf: PathBuf,
+		/// The new revision: one PDF or several
+		#[arg(required = true)]
+		new: Vec<PathBuf>,
+		/// Add pages whose sheet isn't in the drawing at the end
+		#[arg(long)]
+		add_new: bool,
+		/// Only show the matches
+		#[arg(long)]
+		dry_run: bool,
+	},
+		/// Export the takeoff: flattened PDF, markups CSV, quantity summary CSV, Excel workbook.
 	Export {
 		pdf: PathBuf,
 		#[arg(long)]
@@ -114,6 +128,9 @@ enum Cmd {
 		csv: Option<PathBuf>,
 		#[arg(long)]
 		summary: Option<PathBuf>,
+		/// Excel workbook: the markups list and the quantity summary, one sheet each.
+		#[arg(long)]
+		xlsx: Option<PathBuf>,
 	},
 	/// Local models: list installed, check memory fit.
 	Models {
@@ -136,6 +153,11 @@ enum Cmd {
 		model: String,
 		#[arg(long, default_value_t = 32768)]
 		context: u32,
+	},
+	/// Score the agent on drawings with known answers, or probe how well a model places boxes.
+	Eval {
+		#[command(subcommand)]
+		cmd: evals::EvalCmd,
 	},
 	/// Serve the drawing tools over MCP (stdio) for Claude Desktop, Cursor, etc.
 	Mcp {
@@ -294,10 +316,38 @@ fn run(cli: Cli) -> Result<(), String> {
 			sidecar::save(&pdf, &data).map_err(|e| e.to_string())?;
 			println!("{msg}");
 		}
-		Cmd::Export { pdf, pdf_out, csv, summary } => {
+		Cmd::SlipSheet { pdf, new, add_new, dry_run } => {
+			let current = takeoff_pdf::sheets::index(&pdf).map_err(|e| e.to_string())?;
+			let prop = takeoff_pdf::slip::propose(&current, &new).map_err(|e| e.to_string())?;
+			for m in &prop.matches {
+				let (file, key) = &prop.incoming[m.incoming];
+				let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+				let to = match (m.target, m.by) {
+					(Some(t), Some(by)) => format!("→ p{} {} (by {})", t + 1, current[t].name(), by.label()),
+					_ if add_new => "→ added at the end".into(),
+					_ => "→ skipped (not in the drawing)".into(),
+				};
+				println!("{name} p{} {}  {to}", key.page, key.name());
+			}
+			if dry_run {
+				return Ok(());
+			}
+			takeoff_pdf::ops::backup_once(&pdf).map_err(|e| e.to_string())?;
+			let mut data = sidecar::load(&pdf).map_err(|e| e.to_string())?;
+			let out = takeoff_pdf::slip::slip_sheet(&pdf, &mut data, &prop.pages(add_new)).map_err(|e| e.to_string())?;
+			sidecar::save(&pdf, &data).map_err(|e| e.to_string())?;
+			for w in &out.warnings {
+				eprintln!("warning: {w}");
+			}
+			println!("{}", out.message());
+			if let Some(h) = &out.history {
+				println!("old pages kept in {}", h.display());
+			}
+		}
+				Cmd::Export { pdf, pdf_out, csv, summary, xlsx } => {
 			let data = sidecar::load(&pdf).map_err(|e| e.to_string())?;
-			if pdf_out.is_none() && csv.is_none() && summary.is_none() {
-				return Err("say what to export: --pdf-out, --csv and/or --summary".into());
+			if pdf_out.is_none() && csv.is_none() && summary.is_none() && xlsx.is_none() {
+				return Err("say what to export: --pdf-out, --csv, --summary and/or --xlsx".into());
 			}
 			if let Some(o) = pdf_out {
 				let n = takeoff_pdf::export::export_flattened(&pdf, &data, &o).map_err(|e| e.to_string())?;
@@ -312,6 +362,10 @@ fn run(cli: Cli) -> Result<(), String> {
 			}
 			if let Some(o) = summary {
 				std::fs::write(&o, takeoff_core::list::summary_csv(&takeoff_core::list::summary(&doc))).map_err(|e| e.to_string())?;
+				println!("{}", o.display());
+			}
+			if let Some(o) = xlsx {
+				std::fs::write(&o, takeoff_core::list::rows_xlsx(&doc, &takeoff_core::list::rows(&doc))?).map_err(|e| e.to_string())?;
 				println!("{}", o.display());
 			}
 		}
@@ -330,13 +384,15 @@ fn run(cli: Cli) -> Result<(), String> {
 			}
 		},
 		Cmd::Agent { pdf, prompt, page, base_url, api_key, model, context } => agent(pdf, prompt, page, base_url, api_key, model, context)?,
+		Cmd::Eval { cmd } => evals::run(cmd)?,
 		Cmd::Mcp { pdf } => mcp::serve(pdf)?,
 		Cmd::Serve { pdf } => serve::serve(pdf)?,
 	}
 	Ok(())
 }
 
-fn agent(pdf: PathBuf, prompt: String, page: u32, base_url: Option<String>, api_key: Option<String>, model: String, context: u32) -> Result<(), String> {
+/// The endpoint for `model`. "local:<id>" starts llama-server, which runs while the handle lives.
+fn provider(base_url: Option<String>, api_key: Option<String>, model: String, context: u32) -> Result<(takeoff_agent::ProviderConfig, Option<takeoff_models::server::LlamaServer>), String> {
 	let mut _server = None;
 	let provider = if let Some(id) = model.strip_prefix("local:") {
 		let m = takeoff_models::store::installed().into_iter().find(|m| m.id == id).ok_or(format!("no installed model '{id}' (see `takeoff models list`)"))?;
@@ -354,6 +410,11 @@ fn agent(pdf: PathBuf, prompt: String, page: u32, base_url: Option<String>, api_
 		let base = base_url.ok_or("--base-url is required unless --model local:<id>")?;
 		takeoff_agent::ProviderConfig { base_url: base, api_key, model, context_tokens: context, vision: true }
 	};
+	Ok((provider, _server))
+}
+
+fn agent(pdf: PathBuf, prompt: String, page: u32, base_url: Option<String>, api_key: Option<String>, model: String, context: u32) -> Result<(), String> {
+	let (provider, _server) = provider(base_url, api_key, model, context)?;
 	let d = Drawing::open(&pdf).map_err(|e| e.to_string())?;
 	let sizes = (1..=d.page_count()).map(|p| d.page_size_pt(p).map(|(w, h)| (w as f64, h as f64)).unwrap_or((612.0, 792.0))).collect();
 	drop(d);
@@ -393,6 +454,12 @@ fn short(s: &str, n: usize) -> String {
 }
 
 fn main() -> ExitCode {
+	// A subscription CLI (Claude Code, Codex) reaches the drawing tools through
+	// this executable, as it does through the app's (see `takeoff eval run --model claude:…`).
+	let args: Vec<String> = std::env::args().collect();
+	if args.get(1).map(String::as_str) == Some(takeoff_agent::channel::BRIDGE_ARG) {
+		std::process::exit(takeoff_agent::channel::run_bridge(args.get(2).map(String::as_str).unwrap_or("")));
+	}
 	// `takeoff … | head` should end quietly, not panic on a closed pipe.
 	std::panic::set_hook(Box::new(|info| {
 		let msg = info.to_string();
